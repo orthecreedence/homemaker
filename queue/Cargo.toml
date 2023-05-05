@@ -1,0 +1,16 @@
+[package]
+name = "homemaker-queue"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bincode = "1.3"
+crossbeam-channel = "0.5"
+dashmap = "5.4"
+serde = { version = "1.0", features = ["serde_derive"] }
+sled = "0.34"
+thiserror = "1.0"
+tracing = { version = "0.1", features = ["log"] }
+

@@ -1,0 +1,10 @@
+[package]
+name = "homemaker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.70"
+queue = { path = "queue" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
