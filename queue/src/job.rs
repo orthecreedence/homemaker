@@ -13,6 +13,7 @@
 //! This gives us a sort of tiered storage approach: one storage layer for important stuff,
 //! and a less important one for bullshit. The data types here are in support of this model.
 
+use getset::{CopyGetters, Getters, MutGetters};
 use serde::{Serialize, Deserialize};
 use std::ops::Deref;
 
@@ -82,7 +83,8 @@ pub enum JobStatus {
 }
 
 /// A job's state within the queue.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Getters, MutGetters, Serialize, Deserialize)]
+#[getset(get = "pub", get_mut)]
 pub struct JobState {
     /// The channel this job lives in
     pub channel: String,
@@ -115,7 +117,8 @@ impl JobState {
 }
 
 /// Metrics and stats about a single job
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, CopyGetters, MutGetters, Serialize, Deserialize)]
+#[getset(get_copy = "pub", get_mut)]
 pub struct JobMetrics {
     /// How many times this job has been reserved
     pub reserves: u32,
@@ -132,7 +135,8 @@ pub struct JobMetrics {
 /// Represents a job.
 ///
 /// This is any set of data you want to process later.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Getters, MutGetters, Serialize, Deserialize)]
+#[getset(get = "pub", get_mut)]
 pub struct Job {
     /// The job's unique ID
     pub id: JobID,
@@ -178,7 +182,8 @@ impl Job {
 }
 
 /// A struct made specifically for storing jobs in our storage layer
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Getters, MutGetters, Serialize, Deserialize)]
+#[getset(get = "pub", get_mut)]
 pub struct JobStore {
     pub(crate) data: Vec<u8>,
     pub(crate) state: JobState,
@@ -195,7 +200,8 @@ impl From<&Job> for JobStore {
 }
 
 /// A struct made specifically for storing job meta in our storage layer
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Getters, MutGetters, Serialize, Deserialize)]
+#[getset(get = "pub", get_mut)]
 pub struct JobMeta {
     /// Stores the job's metrics, which can generally be thought of as ancillary and can be stored
     /// with looser requirements than primary job data.

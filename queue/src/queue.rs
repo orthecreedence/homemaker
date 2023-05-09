@@ -8,6 +8,7 @@ use crate::{
     ser,
 };
 use dashmap::DashMap;
+use getset::{Getters, MutGetters};
 use sled::Db;
 use tracing::{warn};
 
@@ -41,7 +42,8 @@ macro_rules! update_meta {
 
 /// The main queue datastructure...we create one of these for the process and it
 /// manages all of our jobs and channels for us.
-#[derive(Debug)]
+#[derive(Debug, Getters, MutGetters)]
+#[getset(get = "pub", get_mut)]
 pub struct Queue {
     /// Holds our queue channels
     pub(crate) channels: DashMap<String, Channel>,
@@ -76,14 +78,14 @@ impl Queue {
               D: Into<Delay> + Copy,
     {
         let channel_name = channel_name.into();
-        let job_id_val = self.db_primary.generate_id()?;
+        let job_id_val = self.db_primary().generate_id()?;
         let job_id = JobID::from(job_id_val);
         let state = JobState::new(channel_name.clone(), priority, JobStatus::Ready, ttr, delay);
         let job = Job::new(job_id.clone(), job_data, state);
-        self.db_primary.insert(ser::serialize(&job_id)?, ser::serialize(&JobStore::from(&job))?)?;
-        self.db_meta.insert(ser::serialize(&job_id)?, ser::serialize(&JobMeta::from(&job))?)?;
+        self.db_primary().insert(ser::serialize(&job_id)?, ser::serialize(&JobStore::from(&job))?)?;
+        self.db_meta().insert(ser::serialize(&job_id)?, ser::serialize(&JobMeta::from(&job))?)?;
 
-        let mut channel = self.channels.entry(channel_name).or_insert_with(|| Channel::new());
+        let mut channel = self.channels().entry(channel_name).or_insert_with(|| Channel::new());
         channel.push(job_id.clone(), priority, delay);
         Ok(job_id)
     }
@@ -98,15 +100,15 @@ impl Queue {
     /// been reserved by some other jerk (the wonders of parallelism).
     pub fn dequeue(&self, channels: &Vec<String>) -> Result<Option<Job>> {
         let reserve_from_channel = |channel: &str| -> Result<Option<Job>> {
-            let maybe_job = self.channels.get_mut(channel)
+            let maybe_job = self.channels().get_mut(channel)
                 .and_then(|mut c| c.reserve());
             match maybe_job {
                 Some(job_id) => {
-                    match self.db_primary.get(ser::serialize(&job_id)?)? {
+                    match self.db_primary().get(ser::serialize(&job_id)?)? {
                         Some(store_bytes) => {
                             let store = ser::deserialize(store_bytes.as_ref())?;
                             let meta = update_meta! {
-                                self.db_meta,
+                                self.db_meta(),
                                 &job_id,
                                 meta,
                                 { meta.metrics.reserves += 1}
@@ -133,7 +135,7 @@ impl Queue {
             // the channel we pick will have gotten that job reserved by the time we finish.
             let mut lowest = None;
             for chan in channels {
-                let maybe_job = self.channels.get_mut(chan)
+                let maybe_job = self.channels().get_mut(chan)
                     .and_then(|c| c.peek_ready());
                 match (lowest, maybe_job) {
                     (None, Some((pri, id))) => {
@@ -161,12 +163,12 @@ impl Queue {
         where P: Into<Priority>,
               D: Into<Delay>,
     {
-        let store = self.db_primary.get(ser::serialize(job_id)?)?
+        let store = self.db_primary().get(ser::serialize(job_id)?)?
             .map(|x| ser::deserialize::<JobStore>(x.as_ref()))
             .transpose()?
             .ok_or(Error::JobNotFound(job_id.clone()))?;
         let channel_name = &store.state.channel;
-        let mut channel = self.channels.get_mut(channel_name)
+        let mut channel = self.channels().get_mut(channel_name)
             .ok_or_else(|| {
                 warn!("Queue.release() -- job {0} found but channel {1} (found in {0}'s data) is missing. curious.", job_id, channel_name);
                 Error::JobNotFound(job_id.clone())
@@ -174,7 +176,7 @@ impl Queue {
         let released = channel.release(job_id.clone(), Some(priority), delay)
             .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
         update_meta! {
-            self.db_meta,
+            self.db_meta(),
             &released,
             meta,
             { meta.metrics.releases += 1}
@@ -215,6 +217,11 @@ mod tests {
         assert_eq!(queue1.channels.contains_key("blixtopher"), true);
         assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().ready(), 2);
         assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().delayed(), 0);
+        queue1.enqueue("WORK", Vec::from("get a job".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        assert_eq!(queue1.channels.len(), 2);
+        assert_eq!(queue1.channels.contains_key("WORK"), true);
+        assert_eq!(queue1.channels.get("WORK").unwrap().metrics().ready(), 1);
+        assert_eq!(queue1.channels.get("WORK").unwrap().metrics().delayed(), 0);
 
         let (dbp2, dbm2) = dbs();
         let queue2 = Queue::new(dbp2, dbm2, 128).unwrap();

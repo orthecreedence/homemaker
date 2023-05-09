@@ -10,12 +10,12 @@ use crate::{
     job::{Delay, FailID, JobID, Priority},
 };
 use crossbeam_channel::{self, Sender, Receiver};
-use getset::{CopyGetters, Getters, MutGetters, Setters};
+use getset::{CopyGetters, Getters, MutGetters};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{info};
 
-#[derive(Clone, Debug, Default, CopyGetters, MutGetters, Setters)]
-#[getset(get_copy = "pub", get_mut, set)]
+#[derive(Clone, Debug, Default, CopyGetters, MutGetters)]
+#[getset(get_copy = "pub", get_mut)]
 pub struct ChannelMetrics {
     /// Number of jobs urgent (priority < 1024)
     urgent: u64,
