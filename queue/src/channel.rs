@@ -1,3 +1,11 @@
+//! Channels are effectively what would be "tables" in an RDMS. A channel holds a set of
+//! jobs and manages the state of those jobs (ready, reserved, failed, etc). Much of this
+//! state is meant to be persisted, but not at this level...channels are all in-memory.
+//!
+//! The channel module should really most likely be private since it's not meant to be
+//! interacted with directly (use [`Queue`](crate::queue::Queue) instead) but having it
+//! private make some integration/benchmarking tests more difficult.
+
 use crate::{
     job::{Delay, FailID, JobID, Priority},
 };
@@ -6,25 +14,25 @@ use getset::{CopyGetters, Getters, MutGetters, Setters};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{info};
 
-#[derive(Debug, Default, CopyGetters, MutGetters, Setters)]
-#[getset(get_copy = "pub(crate)", get_mut, set)]
-pub(crate) struct ChannelMetrics {
+#[derive(Clone, Debug, Default, CopyGetters, MutGetters, Setters)]
+#[getset(get_copy = "pub", get_mut, set)]
+pub struct ChannelMetrics {
     /// Number of jobs urgent (priority < 1024)
-    pub(crate) urgent: u64,
+    urgent: u64,
     /// Number of jobs ready
-    pub(crate) ready: u64,
+    ready: u64,
     /// Number of jobs reserved
-    pub(crate) reserved: u64,
+    reserved: u64,
     /// Number of jobs delayed
-    pub(crate) delayed: u64,
+    delayed: u64,
     /// Number of jobs deleted
-    pub(crate) deleted: u64,
+    deleted: u64,
     /// Number of jobs failed
-    pub(crate) failed: u64,
+    failed: u64,
     /// Number of total jobs entered
-    pub(crate) total: u64,
+    total: u64,
     /// Number of active subscribers
-    pub(crate) subscribers: u64,
+    subscribers: u64,
 }
 
 /// A collection of modifications that can happen to a job on a channel, mainly used when
@@ -38,11 +46,11 @@ pub enum ChannelMod {
     Failed,
 }
 
-#[derive(Debug, Getters, MutGetters)]
+#[derive(Clone, Debug, Getters, MutGetters)]
 #[getset(get = "pub(crate)", get_mut)]
-pub(crate) struct Channel {
+pub struct Channel {
     /// Allows interested parties to receive signals on changes in channel state
-    pub(crate) signal: Receiver<ChannelMod>,
+    signal: Receiver<ChannelMod>,
     /// Allows the channel to send signals when things change.
     sender: Sender<ChannelMod>,
     /// Ready job queue, segmented by sorted priority, then `JobId` (aka FIFO)
@@ -61,7 +69,7 @@ pub(crate) struct Channel {
     /// Failed jobs, stored FIFO
     failed: BTreeMap<FailID, (JobID, Priority)>,
     /// Our heroic channel metrics
-    pub(crate) metrics: ChannelMetrics,
+    metrics: ChannelMetrics,
 }
 
 impl Channel {

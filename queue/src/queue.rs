@@ -1,3 +1,6 @@
+//! The queue module is the main interface to the queue system. It manages creation and cleanup
+//! of channels, enqueuing/dequeuing jobs, persistence, etc. It's great.
+
 use crate::{
     channel::Channel,
     error::{Error, Result},
@@ -205,13 +208,13 @@ mod tests {
         queue1.enqueue("blixtopher", Vec::from("get a job".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         assert_eq!(queue1.channels.len(), 1);
         assert_eq!(queue1.channels.contains_key("blixtopher"), true);
-        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics.ready, 1);
-        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics.delayed, 0);
+        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().ready(), 1);
+        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().delayed(), 0);
         queue1.enqueue("blixtopher", Vec::from("say hello".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         assert_eq!(queue1.channels.len(), 1);
         assert_eq!(queue1.channels.contains_key("blixtopher"), true);
-        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics.ready, 2);
-        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics.delayed, 0);
+        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().ready(), 2);
+        assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().delayed(), 0);
 
         let (dbp2, dbm2) = dbs();
         let queue2 = Queue::new(dbp2, dbm2, 128).unwrap();
@@ -220,8 +223,8 @@ mod tests {
         queue2.enqueue("blixtopher", Vec::from("get a job".as_bytes()), 1024, 300, Some(696969696)).unwrap();
         assert_eq!(queue2.channels.len(), 1);
         assert_eq!(queue2.channels.contains_key("blixtopher"), true);
-        assert_eq!(queue2.channels.get("blixtopher").unwrap().metrics.ready, 0);
-        assert_eq!(queue2.channels.get("blixtopher").unwrap().metrics.delayed, 1);
+        assert_eq!(queue2.channels.get("blixtopher").unwrap().metrics().ready(), 0);
+        assert_eq!(queue2.channels.get("blixtopher").unwrap().metrics().delayed(), 1);
     }
 
     #[test]

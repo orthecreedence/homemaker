@@ -1,4 +1,4 @@
-.PHONY: all clean release doc build run test test-panic test-st macros
+.PHONY: all bench clean release doc build run test test-panic test-st macros
 
 # non-versioned include
 VARS ?= vars.mk
@@ -12,6 +12,10 @@ all: build
 run: build
 	$(CARGO) run $(CARGO_BUILD_ARGS)
 
+
+bench:
+	$(CARGO) bench $(TEST) $(CARGO_BUILD_ARGS)
+
 build:
 	$(CARGO) build $(CARGO_BUILD_ARGS)
 
@@ -22,8 +26,7 @@ doc:
 	cargo doc
 
 test-release: override CARGO_BUILD_ARGS += --release
-test-release:
-	$(CARGO) test $(TEST) $(CARGO_BUILD_ARGS) -- --nocapture
+test-release: test
 
 test:
 	$(CARGO) test $(TEST) $(CARGO_BUILD_ARGS) -- --nocapture
