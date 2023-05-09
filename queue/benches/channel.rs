@@ -53,7 +53,11 @@ fn kick_delayed(mut channel: Channel, num: usize) {
     channel.kick_jobs_delayed(num);
 }
 
-fn criterion_benchmark(c: &mut Criterion) {
+fn expire_delayed(mut channel: Channel, now: &Delay) {
+    channel.expire_delayed(now);
+}
+
+fn channel_benchmarks(c: &mut Criterion) {
     let num_jobs = 100_000;
 
     let mut group = c.benchmark_group("push");
@@ -73,7 +77,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("reserve_release_delay");
-    for delay_bucket in [1, 10, 100, 10_000, 100_000].iter() {
+    for delay_bucket in [1, 1000, 100_000].iter() {
         group.bench_with_input(BenchmarkId::new("pri-s", delay_bucket), delay_bucket, |b, &delay| {
             let channel = create_channel(num_jobs, None::<Vec<Delay>>);
             b.iter_batched(|| channel.clone(), |channel| reserve_release_delay(channel, delay), BatchSize::SmallInput)
@@ -97,7 +101,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("kick_failed");
-    for kick_num in [1, 10, 100, 10_000, 100_000].iter() {
+    for kick_num in [1, 1000, 100_000].iter() {
         group.bench_with_input(BenchmarkId::new("pri-s", kick_num), kick_num, |b, &num| {
             let mut channel = create_channel(num_jobs, None::<Vec<Delay>>);
             while let Some(job) = channel.reserve() {
@@ -116,8 +120,8 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.finish();
 
     let mut group = c.benchmark_group("kick_delayed");
-    for delay_bucket in [1, 10, 100, 10_000, 100_000].iter() {
-        let kick_num = 100_000;
+    for delay_bucket in [1, 1000, 100_000].iter() {
+        let kick_num = 100_000; // kick it all
         group.bench_with_input(BenchmarkId::new("pri-s", format!("{}/{}", kick_num, delay_bucket)), delay_bucket, |b, &delay| {
             let buckets = (0..delay.clone()).collect::<Vec<_>>();
             let channel = create_channel(num_jobs, Some(buckets));
@@ -130,8 +134,23 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    let mut group = c.benchmark_group("expire_delayed");
+    for delay_bucket in [1, 1000, 100_000].iter() {
+        let now = 100_001;  // expire everything
+        group.bench_with_input(BenchmarkId::new("pri-s", format!("{}/{}", now, delay_bucket)), delay_bucket, |b, &delay| {
+            let buckets = (0..delay.clone()).collect::<Vec<_>>();
+            let channel = create_channel(num_jobs, Some(buckets));
+            b.iter_batched(|| channel.clone(), |channel| expire_delayed(channel, &Delay::from(now.clone())), BatchSize::SmallInput)
+        });
+        group.bench_with_input(BenchmarkId::new("pri-d", format!("{}/{}", now, delay_bucket)), delay_bucket, |b, &delay| {
+            let buckets = (0..delay.clone()).collect::<Vec<_>>();
+            let channel = create_channel_varying_pri(num_jobs, (1000, 5000), Some(buckets));
+            b.iter_batched(|| channel.clone(), |channel| expire_delayed(channel, &Delay::from(now.clone())), BatchSize::SmallInput)
+        });
+    }
 }
 
-criterion_group!(benches, criterion_benchmark);
+criterion_group!(benches, channel_benchmarks);
 criterion_main!(benches);
 

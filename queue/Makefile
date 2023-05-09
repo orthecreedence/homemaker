@@ -14,7 +14,7 @@ run: build
 
 
 bench:
-	$(CARGO) bench $(TEST) $(CARGO_BUILD_ARGS)
+	$(CARGO) bench $(TEST) $(CARGO_BUILD_ARGS) -- --quiet
 
 build:
 	$(CARGO) build $(CARGO_BUILD_ARGS)
