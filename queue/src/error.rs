@@ -1,6 +1,9 @@
 //! The main error enum for the project lives here, and documents the various
 //! conditions that can arise while interacting with the system.
 
+use crate::{
+    job::JobID,
+};
 use thiserror::Error;
 
 /// This is our error enum. It contains an entry for any part of the system in
@@ -19,9 +22,17 @@ pub enum Error {
     #[error("Error sending on a channel: {0}")]
     ChannelMessageError(String),
 
+    /// That job wasn't found
+    #[error("Job not found: {0}")]
+    JobNotFound(JobID),
+
     /// Error serializing an object
     #[error("Error serializing")]
     Serde(#[from] bincode::Error),
+
+    /// Error in storage layer
+    #[error("Error in storage layer {0}")]
+    StoreError(#[from] sled::Error),
 
     /// Error generating an id
     #[error("Error generating unique ID: {0}")]

@@ -13,9 +13,6 @@
 //! This gives us a sort of tiered storage approach: one storage layer for important stuff,
 //! and a less important one for bullshit. The data types here are in support of this model.
 
-use crate::{
-    error::{Error, Result},
-};
 use serde::{Serialize, Deserialize};
 use std::ops::Deref;
 
@@ -44,6 +41,12 @@ macro_rules! wrapper_primitive {
                 &self.0
             }
         }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
     }
 }
 
@@ -65,22 +68,6 @@ wrapper_primitive! {
 wrapper_primitive! {
     /// A unique ID for failed jobs
     FailID, u64
-}
-
-/// A struct used to track a job's priority
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct JobRef {
-    /// The job's id
-    pub id: JobID,
-    /// The job's priority
-    pub priority: Priority,
-}
-
-impl JobRef {
-    /// Create a new `JobRef`
-    pub fn new(id: JobID, priority: Priority) -> Self {
-        Self { id, priority }
-    }
 }
 
 /// The status a job can have at any given point
@@ -131,15 +118,15 @@ impl JobState {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct JobMetrics {
     /// How many times this job has been reserved
-    reserves: u32,
+    pub reserves: u32,
     /// How many times this job has been released
-    releases: u32,
+    pub releases: u32,
     /// How many times this job has timed out when processing
-    timeouts: u32,
+    pub timeouts: u32,
     /// How many times this job has failed
-    fails: u32,
+    pub fails: u32,
     /// How many times this job has been kicked
-    kicks: u32,
+    pub kicks: u32,
 }
 
 /// Represents a job.
@@ -197,18 +184,6 @@ pub struct JobStore {
     pub(crate) state: JobState,
 }
 
-impl JobStore {
-    pub(crate) fn serialize_binary(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self)
-            .map_err(|e| Error::Serde(e))
-    }
-
-    pub(crate) fn deserialize_binary(ser: &[u8]) -> Result<Self> {
-        bincode::deserialize(ser)
-            .map_err(|e| Error::Serde(e))
-    }
-}
-
 impl From<&Job> for JobStore {
     fn from(job: &Job) -> Self {
         let Job { data, state, .. } = job;
@@ -229,18 +204,6 @@ pub struct JobMeta {
     /// one or the other we allow the delay to be stored in either [`JobState`] as primary data or
     /// here in `JobMeta` as secondary data depending on what the user wants.
     pub(crate) delay: Option<Delay>,
-}
-
-impl JobMeta {
-    pub(crate) fn serialize_binary(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self)
-            .map_err(|e| Error::Serde(e))
-    }
-
-    pub(crate) fn deserialize_binary(ser: &[u8]) -> Result<Self> {
-        bincode::deserialize(ser)
-            .map_err(|e| Error::Serde(e))
-    }
 }
 
 impl From<&Job> for JobMeta {
