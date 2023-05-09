@@ -210,30 +210,29 @@ impl Channel {
     }
 
     /// Kick N failed jobs into the ready queue, returning the number of jobs kicked.
-    pub fn kick_jobs_failed(&mut self, num_jobs: usize) -> usize {
-        let mut counter = 0;
+    pub fn kick_jobs_failed(&mut self, num_jobs: usize) -> Vec<JobID> {
+        let mut kicked = Vec::with_capacity(num_jobs);
         for _ in 0..num_jobs {
             match self.failed_mut().first_entry() {
                 Some(entry) => {
                     let (id, priority) = entry.remove();
-                    self.push_ready_impl(id, priority);
-                    counter += 1;
+                    self.push_ready_impl(id.clone(), priority);
+                    kicked.push(id);
                 }
                 None => break,
             }
         }
-        if counter > 0 {
+        if kicked.len() > 0 {
             self.event(ChannelMod::Ready);
         }
         *self.metrics_mut().failed_mut() = self.failed().len() as u64;
-        counter
+        kicked
     }
 
     /// Kick N delayed jobs into the ready queue, returning the amount we actually kicked (could be
     /// lower than `num_jobs`).
-    pub fn kick_jobs_delayed(&mut self, num_jobs: usize) -> usize {
-        // tracks how many jobs we've kicked
-        let mut counter = 0;
+    pub fn kick_jobs_delayed(&mut self, num_jobs: usize) -> Vec<JobID> {
+        let mut kicked = Vec::with_capacity(num_jobs);
         // tracks any delay queues we can get rid of
         let mut rm_list = Vec::with_capacity(self.delayed.len());
         let mut ready_list = Vec::new();
@@ -243,15 +242,15 @@ impl Channel {
                 match entry.take() {
                     Some((job_id, priority)) => {
                         // can't borrow mutably again, so we save these for later
-                        ready_list.push((job_id, priority));
-                        counter += 1;
+                        ready_list.push((job_id.clone(), priority));
+                        kicked.push(job_id);
                     }
                     None => {}
                 }
                 // mark as processed, even if None. this allows us to do a little
                 // housekeeping
                 queue_processed += 1;
-                if counter >= num_jobs {
+                if kicked.len() >= num_jobs {
                     break;
                 }
             }
@@ -260,7 +259,7 @@ impl Channel {
             if queue_processed >= delqueue.len() {
                 rm_list.push(delay.clone());
             }
-            if counter >= num_jobs {
+            if kicked.len() >= num_jobs {
                 break;
             }
         }
@@ -274,12 +273,12 @@ impl Channel {
         for delay_key in rm_list {
             self.delayed_mut().remove(&delay_key);
         }
-        *self.metrics_mut().delayed_mut() -= counter as u64;
+        *self.metrics_mut().delayed_mut() -= kicked.len() as u64;
 
-        if counter > 0 {
+        if kicked.len() > 0 {
             self.event(ChannelMod::Ready);
         }
-        counter
+        kicked
     }
 
     /// Find all delayed jobs that are ready to move to the ready queue and move them. Returns the
@@ -566,7 +565,9 @@ mod tests {
         assert_eq!(fail_id.deref(), &0);
         assert_counts!(&channel, 0, 1, 0, 0, 66, 33, 100);
 
-        assert_eq!(channel.kick_jobs_failed(10), 10);
+        assert_eq!(channel.kick_jobs_failed(10), [
+            3, 6, 9, 12, 15, 18, 21, 24, 27, 30
+        ].iter().map(|x| JobID::from(x.clone())).collect::<Vec<_>>());
         assert_counts!(&channel, 0, 11, 0, 0, 66, 23, 100);
 
         let mut reserve_counter = 0;
@@ -575,7 +576,10 @@ mod tests {
             assert_eq!(job.deref() % 3, 0);
         }
         assert_eq!(reserve_counter, 11);
-        assert_eq!(channel.kick_jobs_failed(9999999), 23);
+        assert_eq!(channel.kick_jobs_failed(9999999), [
+            33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66,
+            69, 72, 75, 78, 81, 84, 87, 90, 93, 96, 99
+        ].iter().map(|x| JobID::from(x.clone())).collect::<Vec<_>>());
         assert_counts!(&channel, 0, 23, 11, 0, 66, 0, 100);
     }
 
@@ -599,7 +603,10 @@ mod tests {
         assert_eq!(job3, JobID::from(22));
         assert_counts!(&channel, 0, 0, 3, 97, 0, 0, 100);
 
-        assert_eq!(channel.kick_jobs_delayed(23), 23);
+        assert_eq!(
+            channel.kick_jobs_delayed(23),
+            (0..26).filter(|x| x != &1 && x != &5 && x != &22).map(|x| JobID::from(x)).collect::<Vec<_>>()
+        );
         assert_counts!(&channel, 0, 23, 3, 74, 0, 0, 100);
         let job4 = channel.reserve().unwrap();
         let job5 = channel.reserve().unwrap();
@@ -621,11 +628,18 @@ mod tests {
         }
         // kind of cheating here reading len() on delayed, but this is a good test
         assert_eq!(channel2.delayed().len(), 5);
-        assert_eq!(channel2.kick_jobs_delayed(33), 33);
+        assert_eq!(channel2.kick_jobs_delayed(33), [
+            0, 5, 10, 15, 20, 25, 30, 35, 40, 45,
+            50, 55, 60, 65, 70, 75, 80, 85, 90,
+            95, 1, 6, 11, 16, 21, 26, 31, 36, 41,
+            46, 51, 56, 61
+        ].iter().map(|x| JobID::from(x.clone())).collect::<Vec<_>>());
         assert_eq!(channel2.delayed().len(), 4);
-        assert_eq!(channel2.kick_jobs_delayed(6), 6);
+        assert_eq!(channel2.kick_jobs_delayed(6), [
+            66, 71, 76, 81, 86, 91
+        ].iter().map(|x| JobID::from(x.clone())).collect::<Vec<_>>());
         assert_eq!(channel2.delayed().len(), 4);
-        assert_eq!(channel2.kick_jobs_delayed(2), 2);
+        assert_eq!(channel2.kick_jobs_delayed(2), vec![JobID::from(96), JobID::from(2)]);
         assert_eq!(channel2.delayed().len(), 3);
     }
 
