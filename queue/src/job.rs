@@ -84,20 +84,20 @@ pub enum JobStatus {
 
 /// A job's state within the queue.
 #[derive(Clone, Debug, Default, Getters, MutGetters, Serialize, Deserialize)]
-#[getset(get = "pub", get_mut)]
+#[getset(get = "pub", get_mut = "pub(crate)")]
 pub struct JobState {
     /// The channel this job lives in
-    pub channel: String,
+    channel: String,
     /// The job's priority (0 is highest priority)
-    pub priority: Priority,
+    priority: Priority,
     /// The job's current status
-    pub status: JobStatus,
+    status: JobStatus,
     /// How many ms this job can be reserved before it is released
     /// automatically
-    pub ttr: u64,
+    ttr: u64,
     /// An optional delay. This is stored as a timestamp (ms) after which the job will be
     /// ready for processing again.
-    pub delay: Option<Delay>,
+    delay: Option<Delay>,
 }
 
 impl JobState {
@@ -118,34 +118,34 @@ impl JobState {
 
 /// Metrics and stats about a single job
 #[derive(Clone, Debug, Default, CopyGetters, MutGetters, Serialize, Deserialize)]
-#[getset(get_copy = "pub", get_mut)]
+#[getset(get_copy = "pub", get_mut = "pub(crate)")]
 pub struct JobMetrics {
     /// How many times this job has been reserved
-    pub reserves: u32,
+    reserves: u32,
     /// How many times this job has been released
-    pub releases: u32,
+    releases: u32,
     /// How many times this job has timed out when processing
-    pub timeouts: u32,
+    timeouts: u32,
     /// How many times this job has failed
-    pub fails: u32,
+    fails: u32,
     /// How many times this job has been kicked
-    pub kicks: u32,
+    kicks: u32,
 }
 
 /// Represents a job.
 ///
 /// This is any set of data you want to process later.
 #[derive(Debug, Default, Getters, MutGetters, Serialize, Deserialize)]
-#[getset(get = "pub", get_mut)]
+#[getset(get = "pub", get_mut = "pub(crate)")]
 pub struct Job {
     /// The job's unique ID
-    pub id: JobID,
+    id: JobID,
     /// The job's data payload
-    pub data: Vec<u8>,
+    data: Vec<u8>,
     /// The job's current state
-    pub state: JobState,
+    state: JobState,
     /// The job's metrics
-    pub metrics: JobMetrics,
+    metrics: JobMetrics,
 }
 
 impl Job {
@@ -183,10 +183,10 @@ impl Job {
 
 /// A struct made specifically for storing jobs in our storage layer
 #[derive(Clone, Debug, Getters, MutGetters, Serialize, Deserialize)]
-#[getset(get = "pub", get_mut)]
+#[getset(get = "pub", get_mut = "pub(crate)")]
 pub struct JobStore {
-    pub(crate) data: Vec<u8>,
-    pub(crate) state: JobState,
+    data: Vec<u8>,
+    state: JobState,
 }
 
 impl From<&Job> for JobStore {
@@ -201,15 +201,15 @@ impl From<&Job> for JobStore {
 
 /// A struct made specifically for storing job meta in our storage layer
 #[derive(Clone, Debug, Getters, MutGetters, Serialize, Deserialize)]
-#[getset(get = "pub", get_mut)]
+#[getset(get = "pub", get_mut = "pub(crate)")]
 pub struct JobMeta {
     /// Stores the job's metrics, which can generally be thought of as ancillary and can be stored
     /// with looser requirements than primary job data.
-    pub(crate) metrics: JobMetrics,
+    metrics: JobMetrics,
     /// A job's delay can be thought of as either primary or secondary data, so instead of forcing
     /// one or the other we allow the delay to be stored in either [`JobState`] as primary data or
     /// here in `JobMeta` as secondary data depending on what the user wants.
-    pub(crate) delay: Option<Delay>,
+    delay: Option<Delay>,
 }
 
 impl From<&Job> for JobMeta {

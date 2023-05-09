@@ -46,7 +46,7 @@ macro_rules! update_meta {
 #[getset(get = "pub", get_mut)]
 pub struct Queue {
     /// Holds our queue channels
-    pub(crate) channels: DashMap<String, Channel>,
+    channels: DashMap<String, Channel>,
     /// Our queue's primary backing store. Stores critical job data that we simply cannot afford
     /// to lose.
     db_primary: Db,
@@ -111,7 +111,7 @@ impl Queue {
                                 self.db_meta(),
                                 &job_id,
                                 meta,
-                                { meta.metrics.reserves += 1}
+                                { *meta.metrics_mut().reserves_mut() += 1 }
                             };
                             let job = Job::create_from_parts(job_id, store, meta);
                             Ok(Some(job))
@@ -167,7 +167,7 @@ impl Queue {
             .map(|x| ser::deserialize::<JobStore>(x.as_ref()))
             .transpose()?
             .ok_or(Error::JobNotFound(job_id.clone()))?;
-        let channel_name = &store.state.channel;
+        let channel_name = store.state().channel();
         let mut channel = self.channels().get_mut(channel_name)
             .ok_or_else(|| {
                 warn!("Queue.release() -- job {0} found but channel {1} (found in {0}'s data) is missing. curious.", job_id, channel_name);
@@ -179,7 +179,7 @@ impl Queue {
             self.db_meta(),
             &released,
             meta,
-            { meta.metrics.releases += 1}
+            { *meta.metrics_mut().releases_mut() += 1 }
         };
         Ok(())
     }
@@ -244,9 +244,9 @@ mod tests {
         queue1.enqueue("downloads", Vec::from("https://post.vidz.ru/vidoes/YOUR-WIFE-WITH-THE-NEIGHBOR.rar.mp4.avi.exe".as_bytes()), 1001, 300, None::<Delay>).unwrap();
 
         let job1 = queue1.dequeue(&vec!["videos".into()]).unwrap().unwrap();
-        assert_eq!(job1.data, Vec::from("process-vid2".as_bytes()));
-        assert_eq!(job1.state.channel, "videos");
-        assert_eq!(job1.metrics.reserves, 1);
+        assert_eq!(job1.data(), &Vec::from("process-vid2".as_bytes()));
+        assert_eq!(job1.state().channel(), "videos");
+        assert_eq!(job1.metrics().reserves(), 1);
     }
 
     /*
