@@ -234,10 +234,13 @@ impl Queue {
         Ok(released)
     }
 
-
-    //#[tracing::instrument(skip(self))]
-    //pub fn delete(&self, job_id: &JobID) -> Result<JobID> {
-    //}
+    /*
+    /// Delete a job.
+    #[tracing::instrument(skip(self))]
+    pub fn delete(&self, job_id: &JobID) -> Result<JobID> {
+        let job = self.db_primary().get(
+    }
+    */
 }
 
 #[cfg(test)]
@@ -329,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn dequeue_channel_order() {
+    fn dequeue_parallel_strict() {
         let num_threads = 3;
         let (dbp1, dbm1) = dbs();
         let queue1  = Queue::new(dbp1, dbm1, 32).unwrap();

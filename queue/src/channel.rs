@@ -174,7 +174,7 @@ impl Channel {
 
     /// Delete a reserved job.
     #[tracing::instrument(skip(self))]
-    pub fn delete(&mut self, id: JobID) -> Option<JobID> {
+    pub fn delete_reserved(&mut self, id: JobID) -> Option<JobID> {
         self.reserved_mut().remove(&id)?;
         *self.metrics_mut().reserved_mut() = self.reserved().len() as u64;
         *self.metrics_mut().deleted_mut() += 1;
@@ -184,7 +184,7 @@ impl Channel {
 
     /// Fail a reserved job.
     #[tracing::instrument(skip(self))]
-    pub fn fail(&mut self, fail_id: FailID, id: JobID) -> Option<JobID> {
+    pub fn fail_reserved(&mut self, fail_id: FailID, id: JobID) -> Option<JobID> {
         let priority = self.reserved_mut().remove(&id)?;
         let job_ref = (id, priority);
         let job_id = job_ref.0.clone();
@@ -544,23 +544,23 @@ mod tests {
         assert_counts!(&channel, 0, 3, 0, 0, 0, 0, 3);
 
         // can't delete a non-reserved job
-        channel.delete(JobID::from(123));
+        channel.delete_reserved(JobID::from(123));
         assert_counts!(&channel, 0, 3, 0, 0, 0, 0, 3);
 
         let job1 = channel.reserve().unwrap();
         assert_eq!(job1, JobID::from(123));
         assert_counts!(&channel, 0, 2, 1, 0, 0, 0, 3);
-        let job1_2 = channel.delete(job1).unwrap();
+        let job1_2 = channel.delete_reserved(job1).unwrap();
         assert_eq!(job1_2, JobID::from(123));
         assert_counts!(&channel, 0, 2, 0, 0, 1, 0, 3);
 
         let job2 = channel.reserve().unwrap();
-        assert!(channel.delete(job1_2).is_none());
-        channel.delete(job2).unwrap();
+        assert!(channel.delete_reserved(job1_2).is_none());
+        channel.delete_reserved(job2).unwrap();
         assert_counts!(&channel, 0, 1, 0, 0, 2, 0, 3);
 
         let job3 = channel.reserve().unwrap();
-        channel.delete(job3).unwrap();
+        channel.delete_reserved(job3).unwrap();
         assert_counts!(&channel, 0, 0, 0, 0, 3, 0, 3);
     }
 
@@ -572,16 +572,16 @@ mod tests {
         }
         assert_counts!(&channel, 0, 100, 0, 0, 0, 0, 100);
 
-        assert!(channel.fail(FailID::from(1), JobID::from(0)).is_none());
+        assert!(channel.fail_reserved(FailID::from(1), JobID::from(0)).is_none());
         assert_counts!(&channel, 0, 100, 0, 0, 0, 0, 100);
 
         let mut fail_id = 0;
         while let Some(job) = channel.reserve() {
             if job.deref() % 3 == 0 {
-                channel.fail(FailID::from(fail_id), job).unwrap();
+                channel.fail_reserved(FailID::from(fail_id), job).unwrap();
                 fail_id += 1;
             } else {
-                channel.delete(job).unwrap();
+                channel.delete_reserved(job).unwrap();
             }
         }
 
@@ -685,8 +685,8 @@ mod tests {
             channel.push(JobID::from(4), 1024, Some(167000000));
             let res1 = channel.reserve().unwrap();
             let res2 = channel.reserve().unwrap();
-            channel.delete(res1);
-            channel.fail(FailID::from(1), res2);
+            channel.delete_reserved(res1);
+            channel.fail_reserved(FailID::from(1), res2);
             channel.expire_delayed(&Delay::from(167000001));
             let res3 = channel.reserve().unwrap();
             channel.release(res3, None::<Priority>, None::<Delay>);
