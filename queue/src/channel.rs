@@ -688,7 +688,7 @@ mod tests {
         assert_counts!(&channel, 0, 1, 0, 1, 0, 2, 4);
         assert_eq!(channel.delete_failed(FailID::from(123)), Some(JobID::from(123)));
         assert_counts!(&channel, 0, 1, 0, 1, 1, 1, 4);
-        assert_eq!(channel.delete_failed(FailID::from(345)), Some(JobID::from(123)));
+        assert_eq!(channel.delete_failed(FailID::from(345)), Some(JobID::from(345)));
         assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
     }
 
