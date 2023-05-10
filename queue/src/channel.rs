@@ -6,13 +6,14 @@
 //! interacted with directly (use [`Queue`](crate::queue::Queue) instead) but having it
 //! private make some integration/benchmarking tests more difficult.
 
+use ahash::AHashMap;
 use crate::{
     job::{Delay, FailID, JobID, Priority},
 };
 use crossbeam_channel::{self, Sender, Receiver};
 use getset::{CopyGetters, Getters, MutGetters};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use tracing::{info};
+use std::collections::{BTreeMap, BTreeSet};
+use tracing::{trace, info};
 
 #[derive(Clone, Debug, Default, CopyGetters, MutGetters)]
 #[getset(get_copy = "pub", get_mut)]
@@ -56,7 +57,7 @@ pub struct Channel {
     /// Ready job queue, segmented by sorted priority, then `JobId` (aka FIFO)
     ready: BTreeSet<(Priority, JobID)>,
     /// Reserved jobs, indexed by id
-    reserved: HashMap<JobID, Priority>,
+    reserved: AHashMap<JobID, Priority>,
     /// Delayed jobs, ordered by their delay value. Note that we use an `Option` here because
     /// if we kick a delayed job, if using a Vec we'd have to splice the job out of the vec
     /// which could potentially be expensive. Instead, we'll just update it in place to be
@@ -88,6 +89,7 @@ impl Channel {
     }
 
     /// Send a signal
+    #[tracing::instrument(skip(self))]
     fn event(&self, ev: ChannelMod) {
         match self.sender().try_send(ev) {
             Err(e) => info!("Channel::event() -- problem sending event, channel possibly full {:?}", e),
@@ -97,6 +99,7 @@ impl Channel {
 
     fn push_ready_impl<P: Into<Priority>>(&mut self, id: JobID, priority: P) {
         let priority = priority.into();
+        trace!("Channel::push_ready_impl() -- push job {} with priority {}", id, priority);
         self.ready_mut().insert((priority, id));
         *self.metrics_mut().ready_mut() = self.ready().len() as u64;
         if priority < 1024.into() {
@@ -108,16 +111,20 @@ impl Channel {
         where P: Into<Priority>,
               D: Into<Delay>,
     {
-        let entry = self.delayed.entry(delay.into()).or_insert_with(|| Vec::with_capacity(1));
-        (*entry).push(Some((id, priority.into())));
+        let delay = delay.into();
+        let priority = priority.into();
+        trace!("Channel::push_delayed_impl() -- push job {} with priority {} delay {}", id, priority, delay);
+        let entry = self.delayed.entry(delay).or_insert_with(|| Vec::with_capacity(1));
+        (*entry).push(Some((id, priority)));
         *self.metrics_mut().delayed_mut() += 1;
     }
 
     /// Push a job into this channel's queue. It can be given an optional delay value (a ms
     /// timestamp) that will delay processing of that job until the delay passes.
+    #[tracing::instrument(skip(self))]
     pub fn push<P, D>(&mut self, id: JobID, priority: P, delay: Option<D>)
-        where P: Into<Priority>,
-              D: Into<Delay>,
+        where P: Into<Priority> + std::fmt::Debug,
+              D: Into<Delay> + std::fmt::Debug,
     {
         if let Some(delay) = delay {
             self.push_delayed_impl(id, priority, delay);
@@ -130,8 +137,10 @@ impl Channel {
     }
 
     /// Reserve the next available job
+    #[tracing::instrument(skip(self))]
     pub fn reserve(&mut self) -> Option<JobID> {
-        let (priority, job_id) = self.ready.pop_first()?;
+        let next = self.ready.pop_first();
+        let (priority, job_id) = next?;
         self.reserved_mut().insert(job_id.clone(), priority);
         *self.metrics_mut().ready_mut() = self.ready().len() as u64;
         *self.metrics_mut().reserved_mut() = self.reserved().len() as u64;
@@ -143,14 +152,15 @@ impl Channel {
     }
 
     /// Release a reserved job.
+    #[tracing::instrument(skip(self))]
     pub fn release<P, D>(&mut self, id: JobID, priority: Option<P>, delay: Option<D>) -> Option<JobID>
-        where P: Into<Priority>,
-              D: Into<Delay>,
+        where P: Into<Priority> + std::fmt::Debug,
+              D: Into<Delay> + std::fmt::Debug,
     {
-        let existing = self.reserved_mut().remove(&id);
+        let existing = self.reserved_mut().remove(&id)?;
         let priority = priority
             .map(|x| x.into())
-            .or_else(|| existing)?;
+            .unwrap_or_else(|| existing);
         if let Some(delay) = delay {
             self.push_delayed_impl(id, priority, delay);
             self.event(ChannelMod::Delayed);
@@ -163,7 +173,8 @@ impl Channel {
     }
 
     /// Delete a reserved job.
-    pub fn delete_reserved(&mut self, id: JobID) -> Option<JobID> {
+    #[tracing::instrument(skip(self))]
+    pub fn delete(&mut self, id: JobID) -> Option<JobID> {
         self.reserved_mut().remove(&id)?;
         *self.metrics_mut().reserved_mut() = self.reserved().len() as u64;
         *self.metrics_mut().deleted_mut() += 1;
@@ -172,7 +183,8 @@ impl Channel {
     }
 
     /// Fail a reserved job.
-    pub fn fail_reserved(&mut self, fail_id: FailID, id: JobID) -> Option<JobID> {
+    #[tracing::instrument(skip(self))]
+    pub fn fail(&mut self, fail_id: FailID, id: JobID) -> Option<JobID> {
         let priority = self.reserved_mut().remove(&id)?;
         let job_ref = (id, priority);
         let job_id = job_ref.0.clone();
@@ -184,6 +196,7 @@ impl Channel {
     }
 
     /// Kick a specific failed job in the failed queue.
+    #[tracing::instrument(skip(self))]
     pub fn kick_job_failed(&mut self, fail_id: &FailID) -> Option<JobID> {
         self.failed_mut().remove(fail_id)
             .map(|(id, priority)| {
@@ -195,6 +208,7 @@ impl Channel {
     }
 
     /// Kick a specific job in the delayed queue.
+    #[tracing::instrument(skip(self))]
     pub fn kick_job_delayed(&mut self, job_id: &JobID) -> Option<JobID> {
         for (_, delqueue) in self.delayed_mut().iter_mut() {
             if let Some(entry) = delqueue.iter_mut().find(|x| x.map(|x| &x.0 == job_id).unwrap_or(false)) {
@@ -210,6 +224,7 @@ impl Channel {
     }
 
     /// Kick N failed jobs into the ready queue, returning the number of jobs kicked.
+    #[tracing::instrument(skip(self))]
     pub fn kick_jobs_failed(&mut self, num_jobs: usize) -> Vec<JobID> {
         let mut kicked = Vec::with_capacity(num_jobs);
         for _ in 0..num_jobs {
@@ -231,6 +246,7 @@ impl Channel {
 
     /// Kick N delayed jobs into the ready queue, returning the amount we actually kicked (could be
     /// lower than `num_jobs`).
+    #[tracing::instrument(skip(self))]
     pub fn kick_jobs_delayed(&mut self, num_jobs: usize) -> Vec<JobID> {
         let mut kicked = Vec::with_capacity(num_jobs);
         // tracks any delay queues we can get rid of
@@ -283,6 +299,7 @@ impl Channel {
 
     /// Find all delayed jobs that are ready to move to the ready queue and move them. Returns the
     /// number of jobs we moved from delayed into ready.
+    #[tracing::instrument(skip(self))]
     pub fn expire_delayed(&mut self, now: &Delay) -> usize {
         let mut counter = 0;
         let mut sent_ready = false;
@@ -312,11 +329,13 @@ impl Channel {
     }
 
     /// Look at the next ready job
+    #[tracing::instrument(skip(self))]
     pub fn peek_ready(&self) -> Option<(Priority, JobID)> {
         self.ready().first().map(|x| x.clone())
     }
 
     /// Look at the next delayed job
+    #[tracing::instrument(skip(self))]
     pub fn peek_delayed(&self) -> Option<JobID> {
         for (_, delqueue) in self.delayed().iter() {
             if let Some(Some(job)) = delqueue.iter().find(|x| x.is_some()) {
@@ -327,18 +346,21 @@ impl Channel {
     }
 
     /// Look at the next failed job
+    #[tracing::instrument(skip(self))]
     pub fn peek_failed(&self) -> Option<(FailID, JobID)> {
         self.failed().first_key_value().map(|x| (x.0.clone(), x.1.0.clone()))
     }
 
     /// Subscribe to this channel. This returns a crossbeam channel that notifies
     /// listeners when things happen.
+    #[tracing::instrument(skip(self))]
     pub fn subscribe(&mut self) -> Receiver<ChannelMod> {
         *self.metrics_mut().subscribers_mut() += 1;
         self.signal.clone()
     }
 
     /// Unsubscribe from this channel.
+    #[tracing::instrument(skip(self))]
     pub fn unsubscribe(&mut self, signal: Receiver<ChannelMod>) {
         *self.metrics_mut().subscribers_mut() -= 1;
         drop(signal)
@@ -459,6 +481,11 @@ mod tests {
         assert_counts!(&channel, 0, 0, 1, 1, 0, 0, 2);
         channel.release(job7, None::<Priority>, Some(4000)).unwrap();
         assert_counts!(&channel, 0, 0, 0, 2, 0, 0, 2);
+
+        // won't "release" non-reserved jobs
+        let job8 = channel.release(JobID::from(69696969), Some(1024), None::<Delay>);
+        assert_eq!(job8, None);
+        assert_counts!(&channel, 0, 0, 0, 2, 0, 0, 2);
     }
 
     #[test]
@@ -517,23 +544,23 @@ mod tests {
         assert_counts!(&channel, 0, 3, 0, 0, 0, 0, 3);
 
         // can't delete a non-reserved job
-        channel.delete_reserved(JobID::from(123));
+        channel.delete(JobID::from(123));
         assert_counts!(&channel, 0, 3, 0, 0, 0, 0, 3);
 
         let job1 = channel.reserve().unwrap();
         assert_eq!(job1, JobID::from(123));
         assert_counts!(&channel, 0, 2, 1, 0, 0, 0, 3);
-        let job1_2 = channel.delete_reserved(job1).unwrap();
+        let job1_2 = channel.delete(job1).unwrap();
         assert_eq!(job1_2, JobID::from(123));
         assert_counts!(&channel, 0, 2, 0, 0, 1, 0, 3);
 
         let job2 = channel.reserve().unwrap();
-        assert!(channel.delete_reserved(job1_2).is_none());
-        channel.delete_reserved(job2).unwrap();
+        assert!(channel.delete(job1_2).is_none());
+        channel.delete(job2).unwrap();
         assert_counts!(&channel, 0, 1, 0, 0, 2, 0, 3);
 
         let job3 = channel.reserve().unwrap();
-        channel.delete_reserved(job3).unwrap();
+        channel.delete(job3).unwrap();
         assert_counts!(&channel, 0, 0, 0, 0, 3, 0, 3);
     }
 
@@ -545,16 +572,16 @@ mod tests {
         }
         assert_counts!(&channel, 0, 100, 0, 0, 0, 0, 100);
 
-        assert!(channel.fail_reserved(FailID::from(1), JobID::from(0)).is_none());
+        assert!(channel.fail(FailID::from(1), JobID::from(0)).is_none());
         assert_counts!(&channel, 0, 100, 0, 0, 0, 0, 100);
 
         let mut fail_id = 0;
         while let Some(job) = channel.reserve() {
             if job.deref() % 3 == 0 {
-                channel.fail_reserved(FailID::from(fail_id), job).unwrap();
+                channel.fail(FailID::from(fail_id), job).unwrap();
                 fail_id += 1;
             } else {
-                channel.delete_reserved(job).unwrap();
+                channel.delete(job).unwrap();
             }
         }
 
@@ -658,8 +685,8 @@ mod tests {
             channel.push(JobID::from(4), 1024, Some(167000000));
             let res1 = channel.reserve().unwrap();
             let res2 = channel.reserve().unwrap();
-            channel.delete_reserved(res1);
-            channel.fail_reserved(FailID::from(1), res2);
+            channel.delete(res1);
+            channel.fail(FailID::from(1), res2);
             channel.expire_delayed(&Delay::from(167000001));
             let res3 = channel.reserve().unwrap();
             channel.release(res3, None::<Priority>, None::<Delay>);

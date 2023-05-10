@@ -135,7 +135,7 @@ pub struct JobMetrics {
 /// Represents a job.
 ///
 /// This is any set of data you want to process later.
-#[derive(Debug, Default, Getters, MutGetters, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Getters, MutGetters, Serialize, Deserialize)]
 #[getset(get = "pub", get_mut = "pub(crate)")]
 pub struct Job {
     /// The job's unique ID
