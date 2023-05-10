@@ -182,6 +182,55 @@ impl Channel {
         Some(id)
     }
 
+    /// Delete a ready job.
+    #[tracing::instrument(skip(self))]
+    pub fn delete_ready<P>(&mut self, priority: P, id: JobID) -> Option<JobID>
+        where P: Into<Priority> + std::fmt::Debug,
+    {
+        let priority = priority.into();
+        let exists = self.ready_mut().remove(&(priority, id));
+        if exists {
+            *self.metrics_mut().ready_mut() = self.ready().len() as u64;
+            if priority < 1024.into() {
+                *self.metrics_mut().urgent_mut() -= 1;
+            }
+            *self.metrics_mut().deleted_mut() += 1;
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Delete a ready job.
+    #[tracing::instrument(skip(self))]
+    pub fn delete_delayed<D>(&mut self, delay: D, job_id: JobID) -> Option<JobID>
+        where D: Into<Delay> + std::fmt::Debug,
+    {
+        let delay = delay.into();
+        let delqueue = self.delayed_mut().get_mut(&delay)?;
+        if let Some(entry) = delqueue.iter_mut().find(|x| x.map(|x| &x.0 == &job_id).unwrap_or(false)) {
+            // NOTE: look, i hate unwrap more than anybody. but...
+            let (job_id, _priority) = entry.take().unwrap();
+            *self.metrics_mut().delayed_mut() -= 1;
+            *self.metrics_mut().deleted_mut() += 1;
+            return Some(job_id);
+        }
+        None
+    }
+
+    /// Delete a failed job.
+    #[tracing::instrument(skip(self))]
+    pub fn delete_failed(&mut self, fail_id: FailID) -> Option<JobID> {
+        match self.failed_mut().remove(&fail_id) {
+            Some((job_id, _priority)) => {
+                *self.metrics_mut().failed_mut() = self.failed().len() as u64;
+                *self.metrics_mut().deleted_mut() += 1;
+                Some(job_id)
+            }
+            None => None,
+        }
+    }
+
     /// Fail a reserved job.
     #[tracing::instrument(skip(self))]
     pub fn fail_reserved(&mut self, fail_id: FailID, id: JobID) -> Option<JobID> {
@@ -536,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn push_reserve_delete() {
+    fn push_reserve_delete_reserved() {
         let mut channel = Channel::new();
         channel.push(JobID::from(123), 1024, None::<Delay>);
         channel.push(JobID::from(345), 1024, None::<Delay>);
@@ -562,6 +611,85 @@ mod tests {
         let job3 = channel.reserve().unwrap();
         channel.delete_reserved(job3).unwrap();
         assert_counts!(&channel, 0, 0, 0, 0, 3, 0, 3);
+    }
+
+    #[test]
+    fn delete_ready() {
+        let mut channel = Channel::new();
+        channel.push(JobID::from(123), 1024, None::<Delay>);
+        channel.push(JobID::from(345), 1000, None::<Delay>);
+        channel.push(JobID::from(456), 1024, None::<Delay>);
+        channel.push(JobID::from(789), 1024, Some(1111));
+        assert_counts!(&channel, 1, 3, 0, 1, 0, 0, 4);
+        channel.delete_ready(1024, JobID::from(123)).unwrap();
+        assert_counts!(&channel, 1, 2, 0, 1, 1, 0, 4);
+        assert!(channel.delete_ready(1024, JobID::from(123)).is_none());
+        channel.delete_ready(1000, JobID::from(345)).unwrap();
+        assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
+        assert!(channel.delete_ready(1025, JobID::from(456)).is_none());
+        assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
+        assert!(channel.delete_ready(1024, JobID::from(789)).is_none());
+        assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
+        let job1 = channel.reserve().unwrap();
+        assert_eq!(job1, JobID::from(456));
+        let job2 = channel.reserve();
+        assert_eq!(job2, None);
+    }
+
+    #[test]
+    fn delete_delayed() {
+        let mut channel = Channel::new();
+        channel.push(JobID::from(123), 1024, Some(5000));
+        channel.push(JobID::from(345), 1000, Some(4000));
+        channel.push(JobID::from(456), 1024, Some(3000));
+        channel.push(JobID::from(789), 1024, None::<Delay>);
+        assert_counts!(&channel, 0, 1, 0, 3, 0, 0, 4);
+        assert_eq!(channel.delete_delayed(5000, JobID::from(123)).unwrap(), JobID::from(123));
+        assert_counts!(&channel, 0, 1, 0, 2, 1, 0, 4);
+        assert_eq!(channel.delete_delayed(4001, JobID::from(345)), None);
+        assert_counts!(&channel, 0, 1, 0, 2, 1, 0, 4);
+        assert_eq!(channel.delete_delayed(4000, JobID::from(344)), None);
+        assert_counts!(&channel, 0, 1, 0, 2, 1, 0, 4);
+        assert_eq!(channel.delete_delayed(4000, JobID::from(345)).unwrap(), JobID::from(345));
+        assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
+        assert_eq!(channel.delete_delayed(1000, JobID::from(789)), None);
+        assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
+    }
+
+    #[test]
+    fn delete_failed() {
+        let mut channel = Channel::new();
+        channel.push(JobID::from(123), 1024, None::<Delay>);
+        channel.push(JobID::from(345), 1000, None::<Delay>);
+        channel.push(JobID::from(456), 1024, None::<Delay>);
+        channel.push(JobID::from(789), 1024, None::<Delay>);
+        assert_counts!(&channel, 1, 4, 0, 0, 0, 0, 4);
+
+        let job1 = channel.reserve().unwrap();
+        assert_counts!(&channel, 0, 3, 1, 0, 0, 0, 4);
+        let job2 = channel.reserve().unwrap();
+        assert_counts!(&channel, 0, 2, 2, 0, 0, 0, 4);
+        let job3 = channel.reserve().unwrap();
+        assert_counts!(&channel, 0, 1, 3, 0, 0, 0, 4);
+        let job4 = channel.reserve().unwrap();
+        assert_counts!(&channel, 0, 0, 4, 0, 0, 0, 4);
+        channel.release(job3, None::<Priority>, None::<Delay>).unwrap();
+        channel.release(job4, None::<Priority>, Some(5000)).unwrap();
+        assert_counts!(&channel, 0, 1, 2, 1, 0, 0, 4);
+
+        channel.fail_reserved(FailID::from(job1.deref().clone()), job1).unwrap();
+        assert_counts!(&channel, 0, 1, 1, 1, 0, 1, 4);
+        channel.fail_reserved(FailID::from(job2.deref().clone()), job2).unwrap();
+        assert_counts!(&channel, 0, 1, 0, 1, 0, 2, 4);
+
+        assert_eq!(channel.delete_failed(FailID::from(456)), None);
+        assert_counts!(&channel, 0, 1, 0, 1, 0, 2, 4);
+        assert_eq!(channel.delete_failed(FailID::from(789)), None);
+        assert_counts!(&channel, 0, 1, 0, 1, 0, 2, 4);
+        assert_eq!(channel.delete_failed(FailID::from(123)), Some(JobID::from(123)));
+        assert_counts!(&channel, 0, 1, 0, 1, 1, 1, 4);
+        assert_eq!(channel.delete_failed(FailID::from(345)), Some(JobID::from(123)));
+        assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
     }
 
     #[test]
