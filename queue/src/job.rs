@@ -179,6 +179,12 @@ impl Job {
         }
         job
     }
+
+    /// Consume this job and its id, data, and state as a tuple.
+    pub fn take(self) -> (JobID, Vec<u8>, JobState) {
+        let Self { id, data, state, .. } = self;
+        (id, data, state)
+    }
 }
 
 /// A struct made specifically for storing jobs in our storage layer

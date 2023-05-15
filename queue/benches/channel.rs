@@ -30,21 +30,21 @@ fn create_channel_varying_pri<D>(num: usize, priority_range: (usize, usize), del
 }
 
 fn reserve_delete(mut channel: Channel) {
-    while let Some(job) = channel.reserve() {
+    while let Some(job) = channel.reserve_next() {
         channel.delete_reserved(job);
     }
 }
 
 fn reserve_release_delay(mut channel: Channel, delay_buckets: usize) {
     let mut d = 0;
-    while let Some(job) = channel.reserve() {
+    while let Some(job) = channel.reserve_next() {
         channel.release(job, None::<Priority>, Some(((d % delay_buckets) + 1) as i64)).unwrap();
         d += 1;
     }
 }
 
 fn reserve_fail(mut channel: Channel) {
-    while let Some(job) = channel.reserve() {
+    while let Some(job) = channel.reserve_next() {
         channel.fail_reserved(FailID::from(job.deref().clone()), job).unwrap();
     }
 }
@@ -108,14 +108,14 @@ fn benchmarks(c: &mut Criterion) {
     for kick_num in [1, 1000, 100_000].iter() {
         group.bench_with_input(BenchmarkId::new("pri-s", kick_num), kick_num, |b, &num| {
             let mut channel = create_channel(num_jobs, None::<Vec<Delay>>);
-            while let Some(job) = channel.reserve() {
+            while let Some(job) = channel.reserve_next() {
                 channel.fail_reserved(FailID::from(job.deref().clone()), job);
             }
             b.iter_batched(|| channel.clone(), |channel| kick_failed(channel, num), BatchSize::SmallInput)
         });
         group.bench_with_input(BenchmarkId::new("pri-d", kick_num), kick_num, |b, &num| {
             let mut channel = create_channel_varying_pri(num_jobs, (1000, 5000), None::<Vec<Delay>>);
-            while let Some(job) = channel.reserve() {
+            while let Some(job) = channel.reserve_next() {
                 channel.fail_reserved(FailID::from(job.deref().clone()), job);
             }
             b.iter_batched(|| channel.clone(), |channel| kick_failed(channel, num), BatchSize::SmallInput)

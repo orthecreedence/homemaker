@@ -136,11 +136,7 @@ impl Channel {
         *self.metrics_mut().total_mut() += 1;
     }
 
-    /// Reserve the next available job
-    #[tracing::instrument(skip(self))]
-    pub fn reserve(&mut self) -> Option<JobID> {
-        let next = self.ready.pop_first();
-        let (priority, job_id) = next?;
+    fn reserve_impl(&mut self, job_id: JobID, priority: Priority) {
         self.reserved_mut().insert(job_id.clone(), priority);
         *self.metrics_mut().ready_mut() = self.ready().len() as u64;
         *self.metrics_mut().reserved_mut() = self.reserved().len() as u64;
@@ -148,7 +144,30 @@ impl Channel {
             *self.metrics_mut().urgent_mut() -= 1;
         }
         self.event(ChannelMod::Reserved);
+    }
+
+    /// Reserve the next available job
+    #[tracing::instrument(skip(self))]
+    pub fn reserve_next(&mut self) -> Option<JobID> {
+        let next = self.ready.pop_first();
+        let (priority, job_id) = next?;
+        self.reserve_impl(job_id.clone(), priority);
         Some(job_id)
+    }
+
+    /// Reserve the next available job
+    #[tracing::instrument(skip(self))]
+    pub fn reserve_job<P>(&mut self, priority: P, job_id: JobID) -> Option<JobID>
+        where P: Into<Priority> + std::fmt::Debug,
+    {
+        let priority = priority.into();
+        let removed = self.ready.remove(&(priority, job_id));
+        if removed {
+            self.reserve_impl(job_id.clone(), priority);
+            Some(job_id)
+        } else {
+            None
+        }
     }
 
     /// Release a reserved job.
@@ -349,9 +368,8 @@ impl Channel {
     /// Find all delayed jobs that are ready to move to the ready queue and move them. Returns the
     /// number of jobs we moved from delayed into ready.
     #[tracing::instrument(skip(self))]
-    pub fn expire_delayed(&mut self, now: &Delay) -> usize {
-        let mut counter = 0;
-        let mut sent_ready = false;
+    pub fn expire_delayed(&mut self, now: &Delay) -> Vec<JobID> {
+        let mut expired = Vec::new();
         let buckets: Vec<Delay> = self.delayed().keys()
             .filter(|x| x <= &now)
             .map(|x| x.clone())
@@ -361,20 +379,19 @@ impl Channel {
                 Some(jobs) => {
                     for val in jobs {
                         if let Some((id, priority)) = val {
-                            self.push_ready_impl(id, priority);
-                            counter += 1;
-                            sent_ready = true;
+                            self.push_ready_impl(id.clone(), priority);
+                            expired.push(id);
                         }
                     }
                 }
                 None => {}
             }
         }
-        *self.metrics_mut().delayed_mut() -= counter as u64;
-        if sent_ready {
+        *self.metrics_mut().delayed_mut() -= expired.len() as u64;
+        if expired.len() > 0 {
             self.event(ChannelMod::Ready);
         }
-        counter
+        expired
     }
 
     /// Look at the next ready job
@@ -443,13 +460,13 @@ mod tests {
         channel.push(JobID::from(69), 1000, None::<Delay>);
         assert_counts!(&channel, 1, 3, 0, 0, 0, 0, 3);
 
-        let job1 = channel.reserve();
+        let job1 = channel.reserve_next();
         assert_counts!(&channel, 0, 2, 1, 0, 0, 0, 3);
-        let job2 = channel.reserve();
+        let job2 = channel.reserve_next();
         assert_counts!(&channel, 0, 1, 2, 0, 0, 0, 3);
-        let job3 = channel.reserve();
+        let job3 = channel.reserve_next();
         assert_counts!(&channel, 0, 0, 3, 0, 0, 0, 3);
-        let job4 = channel.reserve();
+        let job4 = channel.reserve_next();
         assert_counts!(&channel, 0, 0, 3, 0, 0, 0, 3);
 
         assert_eq!(job1, Some(JobID::from(69)));
@@ -468,12 +485,12 @@ mod tests {
         channel.push(JobID::from(2000), 1000, None::<Delay>);
         channel.push(JobID::from(2002), 500, None::<Delay>);
 
-        let job1 = channel.reserve().unwrap();
-        let job2 = channel.reserve().unwrap();
-        let job3 = channel.reserve().unwrap();
-        let job4 = channel.reserve().unwrap();
-        let job5 = channel.reserve().unwrap();
-        let job6 = channel.reserve().unwrap();
+        let job1 = channel.reserve_next().unwrap();
+        let job2 = channel.reserve_next().unwrap();
+        let job3 = channel.reserve_next().unwrap();
+        let job4 = channel.reserve_next().unwrap();
+        let job5 = channel.reserve_next().unwrap();
+        let job6 = channel.reserve_next().unwrap();
 
         assert_eq!(job1, JobID::from(2002));
         assert_eq!(job2, JobID::from(2001));
@@ -484,13 +501,13 @@ mod tests {
     }
 
     #[test]
-    fn push_release() {
+    fn push_reserve_release() {
         let mut channel = Channel::new();
         channel.push(JobID::from(1111), 1024, None::<Delay>);
         channel.push(JobID::from(1112), 1024, None::<Delay>);
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
 
-        let job1 = channel.reserve().unwrap();
+        let job1 = channel.reserve_next().unwrap();
         assert_eq!(job1, JobID::from(1111));
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
         assert_eq!(channel.peek_ready(), Some((1024.into(), JobID::from(1112))));
@@ -499,9 +516,9 @@ mod tests {
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
 
         // job2 should be the same job as before because of ordering
-        let job2 = channel.reserve().unwrap();
+        let job2 = channel.reserve_next().unwrap();
         assert_eq!(channel.peek_ready(), Some((1024.into(), JobID::from(1112))));
-        let job3 = channel.reserve().unwrap();
+        let job3 = channel.reserve_next().unwrap();
         assert_eq!(channel.peek_ready(), None);
         assert_eq!(job2, JobID::from(1111));
         assert_eq!(job3, JobID::from(1112));
@@ -513,20 +530,20 @@ mod tests {
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
         assert_eq!(channel.peek_ready(), Some((1024.into(), JobID::from(1111))));
 
-        let job4 = channel.reserve().unwrap();
+        let job4 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
         channel.release(job4, Some(1000), None::<Delay>).unwrap();
         assert_counts!(&channel, 1, 2, 0, 0, 0, 0, 2);
-        let job5 = channel.reserve().unwrap();
+        let job5 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
         channel.release(job5, Some(2000), None::<Delay>).unwrap();
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
 
-        let job6 = channel.reserve().unwrap();
+        let job6 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
         channel.release(job6, None::<Priority>, Some(5000)).unwrap();
         assert_counts!(&channel, 0, 1, 0, 1, 0, 0, 2);
-        let job7 = channel.reserve().unwrap();
+        let job7 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 0, 1, 1, 0, 0, 2);
         channel.release(job7, None::<Priority>, Some(4000)).unwrap();
         assert_counts!(&channel, 0, 0, 0, 2, 0, 0, 2);
@@ -538,7 +555,28 @@ mod tests {
     }
 
     #[test]
-    fn push_delayed_expire() {
+    fn reserve_job() {
+        let mut channel = Channel::new();
+        for i in 0..10 {
+            channel.push(JobID::from(i), 1024, None::<Delay>);
+        }
+        assert_counts!(&channel, 0, 10, 0, 0, 0, 0, 10);
+        assert_eq!(channel.reserve_job(1024, JobID::from(999)), None);
+        assert_counts!(&channel, 0, 10, 0, 0, 0, 0, 10);
+        assert_eq!(channel.reserve_job(1000, JobID::from(5)), None);
+        assert_counts!(&channel, 0, 10, 0, 0, 0, 0, 10);
+        let job1 = channel.reserve_job(1024, JobID::from(5)).unwrap();
+        assert_eq!(job1, JobID::from(5));
+        assert_counts!(&channel, 0, 9, 1, 0, 0, 0, 10);
+        channel.delete_reserved(job1).unwrap();
+        assert_counts!(&channel, 0, 9, 0, 0, 1, 0, 10);
+        let job2 = channel.reserve_job(1024, JobID::from(5));
+        assert_eq!(job2, None);
+        assert_counts!(&channel, 0, 9, 0, 0, 1, 0, 10);
+    }
+
+    #[test]
+    fn push_delayed_peek_delayed_expire() {
         let mut channel = Channel::new();
         assert_eq!(channel.peek_delayed(), None);
         channel.push(JobID::from(3), 1024, Some(1678169565578));
@@ -555,30 +593,30 @@ mod tests {
         assert_counts!(&channel, 0, 0, 0, 4, 0, 0, 4);
 
         assert_eq!(channel.delayed().len(), 3); // cheating, but oh well.
-        assert_eq!(channel.reserve(), None);
-        assert_eq!(channel.reserve(), None);
+        assert_eq!(channel.reserve_next(), None);
+        assert_eq!(channel.reserve_next(), None);
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1678169565577)), 0);
+        assert_eq!(channel.expire_delayed(&Delay::from(1678169565577)), vec![]);
         assert_counts!(&channel, 0, 0, 0, 4, 0, 0, 4);
-        assert_eq!(channel.reserve(), None);
+        assert_eq!(channel.reserve_next(), None);
         assert_eq!(channel.delayed().len(), 3); // cheating, but oh well.
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1678169565578)), 2);
+        assert_eq!(channel.expire_delayed(&Delay::from(1678169565578)), vec![JobID::from(3), JobID::from(1)]);
         assert_counts!(&channel, 0, 2, 0, 2, 0, 0, 4);
         assert_eq!(channel.peek_delayed(), Some(JobID::from(2)));
-        assert_eq!(channel.reserve(), Some(JobID::from(1)));
-        assert_eq!(channel.reserve(), Some(JobID::from(3)));
+        assert_eq!(channel.reserve_next(), Some(JobID::from(1)));
+        assert_eq!(channel.reserve_next(), Some(JobID::from(3)));
         assert_counts!(&channel, 0, 0, 2, 2, 0, 0, 4);
         assert_eq!(channel.delayed().len(), 2); // cheating, but oh well.
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1678169565578)), 0);
+        assert_eq!(channel.expire_delayed(&Delay::from(1678169565578)), vec![]);
         assert_counts!(&channel, 0, 0, 2, 2, 0, 0, 4);
         assert_eq!(channel.peek_delayed(), Some(JobID::from(2)));
-        assert_eq!(channel.reserve(), None);
+        assert_eq!(channel.reserve_next(), None);
         assert_counts!(&channel, 0, 0, 2, 2, 0, 0, 4);
         assert_eq!(channel.delayed().len(), 2); // cheating, but oh well.
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1778169565578)), 2);
+        assert_eq!(channel.expire_delayed(&Delay::from(1778169565578)), vec![JobID::from(2), JobID::from(4)]);
         assert_eq!(channel.peek_delayed(), None);
         assert_counts!(&channel, 1, 2, 2, 0, 0, 0, 4);
         assert_eq!(channel.delayed().len(), 0); // cheating, but oh well.
@@ -596,19 +634,19 @@ mod tests {
         channel.delete_reserved(JobID::from(123));
         assert_counts!(&channel, 0, 3, 0, 0, 0, 0, 3);
 
-        let job1 = channel.reserve().unwrap();
+        let job1 = channel.reserve_next().unwrap();
         assert_eq!(job1, JobID::from(123));
         assert_counts!(&channel, 0, 2, 1, 0, 0, 0, 3);
         let job1_2 = channel.delete_reserved(job1).unwrap();
         assert_eq!(job1_2, JobID::from(123));
         assert_counts!(&channel, 0, 2, 0, 0, 1, 0, 3);
 
-        let job2 = channel.reserve().unwrap();
+        let job2 = channel.reserve_next().unwrap();
         assert!(channel.delete_reserved(job1_2).is_none());
         channel.delete_reserved(job2).unwrap();
         assert_counts!(&channel, 0, 1, 0, 0, 2, 0, 3);
 
-        let job3 = channel.reserve().unwrap();
+        let job3 = channel.reserve_next().unwrap();
         channel.delete_reserved(job3).unwrap();
         assert_counts!(&channel, 0, 0, 0, 0, 3, 0, 3);
     }
@@ -630,9 +668,9 @@ mod tests {
         assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
         assert!(channel.delete_ready(1024, JobID::from(789)).is_none());
         assert_counts!(&channel, 0, 1, 0, 1, 2, 0, 4);
-        let job1 = channel.reserve().unwrap();
+        let job1 = channel.reserve_next().unwrap();
         assert_eq!(job1, JobID::from(456));
-        let job2 = channel.reserve();
+        let job2 = channel.reserve_next();
         assert_eq!(job2, None);
     }
 
@@ -646,6 +684,7 @@ mod tests {
         assert_counts!(&channel, 0, 1, 0, 3, 0, 0, 4);
         assert_eq!(channel.delete_delayed(5000, JobID::from(123)).unwrap(), JobID::from(123));
         assert_counts!(&channel, 0, 1, 0, 2, 1, 0, 4);
+        // delay/id must match OR ELSE
         assert_eq!(channel.delete_delayed(4001, JobID::from(345)), None);
         assert_counts!(&channel, 0, 1, 0, 2, 1, 0, 4);
         assert_eq!(channel.delete_delayed(4000, JobID::from(344)), None);
@@ -665,13 +704,13 @@ mod tests {
         channel.push(JobID::from(789), 1024, None::<Delay>);
         assert_counts!(&channel, 1, 4, 0, 0, 0, 0, 4);
 
-        let job1 = channel.reserve().unwrap();
+        let job1 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 3, 1, 0, 0, 0, 4);
-        let job2 = channel.reserve().unwrap();
+        let job2 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 2, 2, 0, 0, 0, 4);
-        let job3 = channel.reserve().unwrap();
+        let job3 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 1, 3, 0, 0, 0, 4);
-        let job4 = channel.reserve().unwrap();
+        let job4 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 0, 4, 0, 0, 0, 4);
         channel.release(job3, None::<Priority>, None::<Delay>).unwrap();
         channel.release(job4, None::<Priority>, Some(5000)).unwrap();
@@ -704,7 +743,7 @@ mod tests {
         assert_counts!(&channel, 0, 100, 0, 0, 0, 0, 100);
 
         let mut fail_id = 0;
-        while let Some(job) = channel.reserve() {
+        while let Some(job) = channel.reserve_next() {
             if job.deref() % 3 == 0 {
                 channel.fail_reserved(FailID::from(fail_id), job).unwrap();
                 fail_id += 1;
@@ -726,7 +765,7 @@ mod tests {
         assert_counts!(&channel, 0, 11, 0, 0, 66, 23, 100);
 
         let mut reserve_counter = 0;
-        while let Some(job) = channel.reserve() {
+        while let Some(job) = channel.reserve_next() {
             reserve_counter += 1;
             assert_eq!(job.deref() % 3, 0);
         }
@@ -749,10 +788,10 @@ mod tests {
         channel.kick_job_delayed(&JobID::from(22)).unwrap();
         channel.kick_job_delayed(&JobID::from(5)).unwrap();
         assert_counts!(&channel, 0, 3, 0, 97, 0, 0, 100);
-        let job1 = channel.reserve().unwrap();
-        let job2 = channel.reserve().unwrap();
-        let job3 = channel.reserve().unwrap();
-        assert_eq!(channel.reserve(), None);
+        let job1 = channel.reserve_next().unwrap();
+        let job2 = channel.reserve_next().unwrap();
+        let job3 = channel.reserve_next().unwrap();
+        assert_eq!(channel.reserve_next(), None);
         assert_eq!(job1, JobID::from(1));
         assert_eq!(job2, JobID::from(5));
         assert_eq!(job3, JobID::from(22));
@@ -763,12 +802,12 @@ mod tests {
             (0..26).filter(|x| x != &1 && x != &5 && x != &22).map(|x| JobID::from(x)).collect::<Vec<_>>()
         );
         assert_counts!(&channel, 0, 23, 3, 74, 0, 0, 100);
-        let job4 = channel.reserve().unwrap();
-        let job5 = channel.reserve().unwrap();
-        let job6 = channel.reserve().unwrap();
-        let job7 = channel.reserve().unwrap();
-        let job8 = channel.reserve().unwrap();
-        let job9 = channel.reserve().unwrap();
+        let job4 = channel.reserve_next().unwrap();
+        let job5 = channel.reserve_next().unwrap();
+        let job6 = channel.reserve_next().unwrap();
+        let job7 = channel.reserve_next().unwrap();
+        let job8 = channel.reserve_next().unwrap();
+        let job9 = channel.reserve_next().unwrap();
         assert_eq!(job4, JobID::from(0));
         assert_eq!(job5, JobID::from(2));
         assert_eq!(job6, JobID::from(3));
@@ -811,12 +850,12 @@ mod tests {
             channel.push(JobID::from(2), 1024, None::<Delay>);
             channel.push(JobID::from(3), 1024, Some(167000000));
             channel.push(JobID::from(4), 1024, Some(167000000));
-            let res1 = channel.reserve().unwrap();
-            let res2 = channel.reserve().unwrap();
+            let res1 = channel.reserve_next().unwrap();
+            let res2 = channel.reserve_next().unwrap();
             channel.delete_reserved(res1);
             channel.fail_reserved(FailID::from(1), res2);
             channel.expire_delayed(&Delay::from(167000001));
-            let res3 = channel.reserve().unwrap();
+            let res3 = channel.reserve_next().unwrap();
             channel.release(res3, None::<Priority>, None::<Delay>);
             channel.unsubscribe(sig2);
             assert_eq!(channel.metrics.subscribers, 0);

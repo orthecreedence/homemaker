@@ -9,9 +9,10 @@ use crate::{
     ser,
 };
 use dashmap::DashMap;
+use derive_builder::Builder;
 use getset::{Getters, MutGetters};
 use sled::Db;
-use std::sync::Mutex;
+use std::sync::{Mutex};
 use tracing::{warn};
 
 /// A handy macro to wrap some gibberish around updating inline stats in our db.
@@ -44,7 +45,6 @@ macro_rules! update_meta {
 
 /// Defines guarantees for [dequeuing][Queue::dequeue] jobs *from multiple channels*.
 /// This does not matter if only grabbing jobs from one channel.
-#[derive(Debug)]
 pub enum Ordering {
     /// Loose ordering is fast but won't necessarily return the jobs in order of
     /// priority/id across multiple channels. It's faster because it it does not
@@ -57,6 +57,33 @@ pub enum Ordering {
     /// guarantees strict priority/id ordering, but blocks other threads from
     /// grabbing jobs.
     Strict,
+    /// Exactly like `Strict` ordering, but lets you run a function while the channel
+    /// lock is being held open (just before unlocking). Probably only good for testing.
+    /// But wow, is it great for testing.
+    StrictOp(Box<dyn FnMut()>),
+}
+
+impl std::fmt::Debug for Ordering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loose => write!(f, "Loose"),
+            Self::Strict => write!(f, "Strict"),
+            Self::StrictOp(_) => write!(f, "StrictOp(FnMut)"),
+        }
+    }
+}
+
+/// Configured some options our queue might have
+#[derive(Builder, Debug, Default, Getters, MutGetters)]
+#[getset(get = "pub", get_mut)]
+#[builder(pattern = "owned")]
+pub struct QueueConfig {
+    /// If false (the default), stores job delays in the primary storage, making delays and
+    /// expirations more resilient (but less performant). If you don't care about your delay
+    /// values as much, and you use delays quite often (for example for rate limiting), you
+    /// can get a great performance boost setting this to `true`.
+    #[builder(default = "false")]
+    delay_in_meta: bool,
 }
 
 /// The main queue datastructure...we create one of these for the process and it
@@ -64,6 +91,8 @@ pub enum Ordering {
 #[derive(Debug, Getters, MutGetters)]
 #[getset(get = "pub", get_mut)]
 pub struct Queue {
+    /// Configuration for the queue
+    config: QueueConfig,
     /// Holds our queue channels
     channels: DashMap<String, Channel, RandomState>,
     /// Our queue's primary backing store. Stores critical job data that we simply cannot afford
@@ -82,14 +111,71 @@ pub struct Queue {
 impl Queue {
     /// Create a new `Queue` object. This will read the underlying storage object and recreate
     /// the jobs and channels within that storage layer in-memory.
-    pub fn new(db_primary: Db, db_meta: Db, estimated_num_channels: usize) -> Result<Self> {
+    pub fn new(config: QueueConfig, db_primary: Db, db_meta: Db, estimated_num_channels: usize) -> Result<Self> {
         let channels = DashMap::with_capacity_and_hasher_and_shard_amount(estimated_num_channels, RandomState::new(), estimated_num_channels);
         Ok(Self {
+            config,
             channels,
             db_primary,
             db_meta,
             dequeue_lock: Mutex::new(()),
         })
+    }
+
+    /// Loads the jobs inside the primary data store and puts them into their corresponding
+    /// channels. You probably want to call this every time you create a `Queue` object.
+    ///
+    /// Returns the number of jobs loaded.
+    pub fn restore(&self) -> Result<u64> {
+        let mut counter = 0;        // TODO: use metrics when implemented
+        for res in self.db_primary().iter() {
+            let (job_id_ser, job_store_ser) = res?;
+            let job_id: JobID = ser::deserialize(&job_id_ser)?;
+            let store: JobStore = ser::deserialize(&job_store_ser)?;
+            let meta: Option<JobMeta> = self.db_meta().get(&job_id_ser)?
+                .map(|x| ser::deserialize(&x))
+                .transpose()?;
+            let job = Job::create_from_parts(job_id, store, meta);
+            let (job_id, job_data, job_state) = job.take();
+            self.enqueue_impl(job_state.channel().clone(), job_id, job_data, job_state.priority().clone(), job_state.ttr().clone(), job_state.delay().clone())?;
+            counter += 1;
+        }
+        Ok(counter)
+    }
+
+    /// Expires delayed jobs that have passed their time. Takes a `now` value which basically
+    /// tells us what time it is (same format as delay values: unix timestamp in ms).
+    #[tracing::instrument(skip(self))]
+    pub fn expire_delayed<D>(&self, now: D) -> Result<()>
+        where D: Into<Delay> + Copy + std::fmt::Debug,
+    {
+        let now = now.into();
+        let mut expired = Vec::new();
+        for mut chan in self.channels().iter_mut() {
+            let mut expired_loc = chan.value_mut().expire_delayed(&now);
+            // instead of handling the updating of the jobs in storage here, we push whatever
+            // jobs we got onto the big todo list and keep going. want to keep these locks
+            // for as short as possible.
+            expired.append(&mut expired_loc);
+        }
+        for job_id in expired {
+            update_meta! {
+                self.db_meta(),
+                &job_id,
+                meta,
+                { *meta.delay_mut() = None; }
+            };
+        }
+        Ok(())
+    }
+
+    /// Puts stuff into a channel without saving to DB. Good for restoring.
+    fn enqueue_impl(&self, channel_name: String, job_id: JobID, job_data: Vec<u8>, priority: Priority, ttr: u64, delay: Option<Delay>) -> Result<Job> {
+        let state = JobState::new(channel_name, priority, JobStatus::Ready, ttr, delay);
+        let job = Job::new(job_id.clone(), job_data, state);
+        let mut channel = self.channels().entry(job.state().channel().clone()).or_insert_with(|| Channel::new());
+        channel.push(job_id.clone(), priority, delay);
+        Ok(job)
     }
 
     /// Push a new job into the queue.
@@ -103,17 +189,13 @@ impl Queue {
               P: Into<Priority> + Copy + std::fmt::Debug,
               D: Into<Delay> + Copy + std::fmt::Debug,
     {
-        let channel_name = channel_name.into();
         let job_id_val = self.db_primary().generate_id()?;
         let job_id = JobID::from(job_id_val);
-        let state = JobState::new(channel_name.clone(), priority, JobStatus::Ready, ttr, delay);
-        let job = Job::new(job_id.clone(), job_data, state);
+        let job = self.enqueue_impl(channel_name.into(), job_id, job_data, priority.into(), ttr, delay.map(|x| x.into()))?;
         self.db_primary().insert(ser::serialize(&job_id)?, ser::serialize(&JobStore::from(&job))?)?;
         self.db_meta().insert(ser::serialize(&job_id)?, ser::serialize(&JobMeta::from(&job))?)?;
 
-        let mut channel = self.channels().entry(channel_name).or_insert_with(|| Channel::new());
-        channel.push(job_id.clone(), priority, delay);
-        Ok(job_id)
+        Ok(job.id().clone())
     }
 
     /// Pull a single job off the given list of channels, marking it as reserved so others cannot
@@ -127,7 +209,7 @@ impl Queue {
     #[tracing::instrument(skip(self))]
     pub fn dequeue(&self, channels: &Vec<String>, ordering: Ordering) -> Result<Option<Job>> {
         let reserve_from_channel = |channel: &mut Channel| -> Result<Option<Job>> {
-            let maybe_job = channel.reserve();
+            let maybe_job = channel.reserve_next();
             match maybe_job {
                 Some(job_id) => {
                     match self.db_primary().get(ser::serialize(&job_id)?)? {
@@ -162,7 +244,7 @@ impl Queue {
             }
         } else {
             let lock = match ordering {
-                Ordering::Strict => {
+                Ordering::Strict | Ordering::StrictOp(_) => {
                     let handle = match self.dequeue_lock().lock() {
                         Ok(x) => x,
                         Err(e) => Err(Error::ChannelLockError(format!("{:?}", e)))?,
@@ -176,8 +258,7 @@ impl Queue {
             // the channel we pick will have gotten that job reserved by the time we finish.
             let mut lowest = None;
             for chan in channels {
-                let lock = self.channels().get_mut(chan);
-                let maybe_job = lock.as_ref()
+                let maybe_job = self.channels().get_mut(chan).as_ref()
                     .and_then(|c| c.peek_ready().clone());
                 match (lowest, maybe_job) {
                     (None, Some((pri, id))) => {
@@ -202,8 +283,39 @@ impl Queue {
             } else {
                 Ok(None)
             };
+            if let Ordering::StrictOp(mut op) = ordering {
+                op();
+            }
             drop(lock);
             ret
+        }
+    }
+
+    /// Dequeue/reserve a job by its [`JobID`]. If the job isn't in the "ready" state, we return
+    /// `Ok(None)`.
+    #[tracing::instrument(skip(self))]
+    pub fn dequeue_job(&self, job_id: JobID) -> Result<Option<Job>> {
+        let job_id_ser = ser::serialize(&job_id)?;
+        let stored_bytes = self.db_primary.get(&job_id_ser)?
+            .ok_or(Error::JobNotFound(job_id.clone()))?;
+        let job_store: JobStore = ser::deserialize(&stored_bytes)?;
+        match self.channels.get_mut(job_store.state().channel()) {
+            Some(mut chan) => {
+                match chan.reserve_job(job_store.state().priority().clone(), job_id.clone()) {
+                    Some(_) => {
+                        let job_meta = update_meta! {
+                            self.db_meta(),
+                            &job_id,
+                            meta,
+                            { *meta.metrics_mut().reserves_mut() += 1 }
+                        };
+                        let job = Job::create_from_parts(job_id, job_store, job_meta);
+                        Ok(Some(job))
+                    }
+                    None => Ok(None),
+                }
+            }
+            None => Ok(None),
         }
     }
 
@@ -236,19 +348,28 @@ impl Queue {
 
     /*
     /// Delete a job.
+    ///
+    /// If the job is in the reserved
     #[tracing::instrument(skip(self))]
     pub fn delete(&self, job_id: &JobID) -> Result<JobID> {
-        let job = self.db_primary().get(
+        let job_id_ser = ser::serialize(&job_id)?;
+        let job_ser = self.db_primary
     }
     */
+
+    #[cfg(test)]
+    /// Consume the queue and return the internal databases. For testing mainly.
+    fn take_db(self) -> (Db, Db) {
+        let Self { db_primary, db_meta, .. } = self;
+        (db_primary, db_meta)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ops::Deref;
-    use std::sync::{Arc, RwLock};
-    use std::time::{Instant};
+    use std::sync::{Arc, RwLock, atomic::{AtomicU64, Ordering as AtomicOrdering}};
 
     fn dbs() -> (sled::Db, sled::Db) {
         let db_primary = sled::Config::default()
@@ -262,10 +383,15 @@ mod tests {
         (db_primary, db_meta)
     }
 
+    fn make_queue(num_chan: usize) -> Queue {
+        let (dbp1, dbm1) = dbs();
+        let config = QueueConfigBuilder::default().build().unwrap();
+        Queue::new(config, dbp1, dbm1, num_chan).unwrap()
+    }
+
     #[test]
     fn enqueue() {
-        let (dbp1, dbm1) = dbs();
-        let queue1 = Queue::new(dbp1, dbm1, 32).unwrap();
+        let queue1 = make_queue(32);
         assert_eq!(queue1.channels.len(), 0);
         assert_eq!(queue1.channels.contains_key("blixtopher"), false);
         queue1.enqueue("blixtopher", Vec::from("get a job".as_bytes()), 1024, 300, None::<Delay>).unwrap();
@@ -284,8 +410,7 @@ mod tests {
         assert_eq!(queue1.channels.get("WORK").unwrap().metrics().ready(), 1);
         assert_eq!(queue1.channels.get("WORK").unwrap().metrics().delayed(), 0);
 
-        let (dbp2, dbm2) = dbs();
-        let queue2 = Queue::new(dbp2, dbm2, 128).unwrap();
+        let queue2 = make_queue(128);
         assert_eq!(queue2.channels.len(), 0);
         assert_eq!(queue2.channels.contains_key("blixtopher"), false);
         queue2.enqueue("blixtopher", Vec::from("get a job".as_bytes()), 1024, 300, Some(696969696)).unwrap();
@@ -297,8 +422,7 @@ mod tests {
 
     #[test]
     fn dequeue() {
-        let (dbp1, dbm1) = dbs();
-        let queue1  = Queue::new(dbp1, dbm1, 32).unwrap();
+        let queue1  = make_queue(32);
         queue1.enqueue("videos", Vec::from("process-vid1".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         queue1.enqueue("videos", Vec::from("process-vid2".as_bytes()), 1000, 300, None::<Delay>).unwrap();
         queue1.enqueue("videos", Vec::from("process-vid3".as_bytes()), 1000, 300, None::<Delay>).unwrap();
@@ -332,10 +456,86 @@ mod tests {
     }
 
     #[test]
+    fn restore() {
+        let queue1 = make_queue(32);
+        let job1 = queue1.enqueue("jobs", Vec::from("do stuff".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("jobs", Vec::from("do something".as_bytes()), 0, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("jobs", Vec::from("do later".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job4 = queue1.enqueue("todo", Vec::from("make todo list".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        // "i have done that," said toad
+        let job5 = queue1.enqueue("todo", Vec::from("wake up".as_bytes()), 1024, 300, Some(4000)).unwrap();
+        for i in 0..9000 {
+            queue1.enqueue("chain", Vec::from(format!("send this queue to {} people or else", i).as_bytes()), 2000, 300, None::<Delay>).unwrap();
+        }
+
+        let (db1_p, db1_m) = queue1.take_db();
+        let queue2 = Queue::new(QueueConfigBuilder::default().build().unwrap(), db1_p, db1_m, 32).unwrap();
+        let deq0 = queue2.dequeue(&vec!["jobs".into(), "todo".into(), "chain".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq0.as_ref().map(|x| x.id()), None);
+        queue2.restore().unwrap();
+
+        let deq1 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        let deq2 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        let deq3 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        let deq4 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        let deq5 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq1.unwrap().id(), &job2);
+        assert_eq!(deq2.unwrap().id(), &job1);
+        assert_eq!(deq3.unwrap().id(), &job4);
+        assert_eq!(deq4.as_ref().map(|x| x.id()), None);
+        assert_eq!(deq5.as_ref().map(|x| x.id()), None);
+        queue2.expire_delayed(5000).unwrap();
+        let deq6 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        let deq7 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq6.unwrap().id(), &job3);
+        assert_eq!(deq7.unwrap().id(), &job5);
+        let deq8 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq8.as_ref().map(|x| x.id()), None);
+
+        let mut counter = 0;
+        while let Some(deq) = queue2.dequeue(&vec!["chain".into()], Ordering::Strict).unwrap() {
+            assert_eq!(String::from_utf8(deq.data().clone()).unwrap(), format!("send this queue to {} people or else", counter));
+            counter += 1;
+        }
+        assert_eq!(counter, 9000);
+    }
+
+    #[test]
+    fn dequeue_job() {
+        let queue = make_queue(32);
+        let job1 = queue.enqueue("jobs", Vec::from("jerry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue.enqueue("jobs", Vec::from("larry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue.enqueue("jobs", Vec::from("barry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job4 = queue.enqueue("jobs", Vec::from("mary".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job5 = queue.enqueue("jobs", Vec::from("harry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job6 = queue.enqueue("jobs", Vec::from("dary".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+
+        let deq1 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq1.as_ref().map(|x| x.id()), Some(&job1));
+        assert_eq!(queue.release(&job1, 1024, None::<Delay>).unwrap(), job1);
+
+        let deq_id = queue.dequeue_job(job4.clone()).unwrap();
+        assert_eq!(deq_id.as_ref().map(|x| x.id()), Some(&job4));
+
+        let deq2 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        let deq3 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        let deq4 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        let deq5 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        let deq6 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        let deq7 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap();
+
+        assert_eq!(deq2.id(), &job1);
+        assert_eq!(deq3.id(), &job2);
+        assert_eq!(deq4.id(), &job3);
+        assert_eq!(deq5.id(), &job5);
+        assert_eq!(deq6.id(), &job6);
+        assert_eq!(deq7.as_ref().map(|x| x.id()), None);
+    }
+
+    #[test]
     fn dequeue_parallel_strict() {
-        let num_threads = 3;
-        let (dbp1, dbm1) = dbs();
-        let queue1  = Queue::new(dbp1, dbm1, 32).unwrap();
+        let num_threads = 128;
+        let queue1 = make_queue(32);
         let job1_id = queue1.enqueue("vids1", Vec::from("threw rocks at my car".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         let job2_id = queue1.enqueue("vids2", Vec::from("we don't have any kids".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         let job3_id = queue1.enqueue("vids3", Vec::from("went to the house of the kids".as_bytes()), 1000, 300, None::<Delay>).unwrap();
@@ -348,8 +548,7 @@ mod tests {
         assert_eq!(deq3.id(), &job2_id);
 
         // ok, let's create a parallel version of the ordering stuff.
-        let (dbp2, dbm2) = dbs();
-        let queue2  = Arc::new(Queue::new(dbp2, dbm2, 32).unwrap());
+        let queue2  = Arc::new(make_queue(32));
         for pri in [1024, 1000, 100, 2000].iter() {
             for i in 0..5 {
                 for chan in ["vids1", "vids2", "vids3"].iter() {
@@ -357,16 +556,33 @@ mod tests {
                 }
             }
         }
+        let counter = Arc::new(AtomicU64::new(0));
         let results = Arc::new(RwLock::new(Vec::new()));
         let mut handles = Vec::new();
         for _ in 0..num_threads {
             let q = queue2.clone();
             let res = results.clone();
+            let counterc = counter.clone();
             let handle = std::thread::spawn(move || {
                 let mut jobs = Vec::new();
+                // do some freaky shit with locks and SrictOp to verify dequeue() is returning
+                // jobs in the correct order across our threads. you might be tempted to increment
+                // a  counter just after the dequeue op, but that will lead to ordering errors.
+                // it must be done *with the channel lock held open* which is why we use StrictOp.
+                let get = || {
+                    let counter_arc = Arc::new(RwLock::new(0));
+                    let counter_res = counter_arc.clone();
+                    let counterc_2 = counterc.clone();
+                    let order = Ordering::StrictOp(Box::new(move || {
+                        let mut guard = counter_arc.write().unwrap();
+                        (*guard) = counterc_2.fetch_add(1, AtomicOrdering::SeqCst);
+                    }));
+                    let job = q.dequeue(&vec!["vids1".into(), "vids2".into(), "vids3".into()], order).unwrap();
+                    job.map(|j| ((*counter_res.read().unwrap()), j))
+                };
                 // do all our dequeues before doing any locking.
-                while let Some(job) = q.dequeue(&vec!["vids1".into(), "vids2".into(), "vids3".into()], Ordering::Strict).unwrap() {
-                    jobs.push((Instant::now(), job));
+                while let Some((counter_val, job)) = get() {
+                    jobs.push((counter_val, job));
                 }
                 // now lock the result set and push our stupid jobs onto the end
                 for j in jobs {
@@ -423,8 +639,7 @@ mod tests {
 
     #[test]
     fn release() {
-        let (dbp1, dbm1) = dbs();
-        let queue1  = Queue::new(dbp1, dbm1, 32).unwrap();
+        let queue1 = make_queue(32);
         queue1.enqueue("videos", Vec::from("process-vid1".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         queue1.enqueue("videos", Vec::from("process-vid2".as_bytes()), 1000, 300, None::<Delay>).unwrap();
         queue1.enqueue("videos", Vec::from("process-vid3".as_bytes()), 1000, 300, None::<Delay>).unwrap();
@@ -446,48 +661,5 @@ mod tests {
         assert_eq!(job3.metrics().reserves(), 2);
         assert_eq!(job3.metrics().releases(), 1);
     }
-
-    /*
-    #[test]
-    fn bench_hash() {
-        let chan_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        let channels = std::sync::Arc::new(std::sync::RwLock::new(chan_map));
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let map = channels.clone();
-            handles.push(std::thread::spawn(move || {
-                for i in 0..3000000 {
-                    let mut handle = map.write().unwrap();
-                    let key = format!("chan-{}", i % 200);
-                    (*handle).entry(key)
-                        .and_modify(|e| (*e) += 1)
-                        .or_insert(1);
-                }
-            }));
-        }
-        for handle in handles { handle.join().unwrap(); }
-        println!("map {:?}", channels.read().unwrap());
-    }
-
-    #[test]
-    fn bench_dash() {
-        let chan_map: dashmap::DashMap<String, u64> = dashmap::DashMap::with_shard_amount(256);
-        let channels = std::sync::Arc::new(chan_map);
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let map = channels.clone();
-            handles.push(std::thread::spawn(move || {
-                for i in 0..3000000 {
-                    let key = format!("chan-{}", i % 200);
-                    map.entry(key)
-                        .and_modify(|e| (*e) += 1)
-                        .or_insert(1);
-                }
-            }));
-        }
-        for handle in handles { handle.join().unwrap(); }
-        println!("map {:?}", channels);
-    }
-    */
 }
 
