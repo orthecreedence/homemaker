@@ -79,7 +79,7 @@ pub enum JobStatus {
     Ready,
     /// The job is failed (with a binary error message) and unavailable for
     /// processing until kicked
-    Failed(FailID, Vec<u8>),
+    Failed(FailID, Option<Vec<u8>>),
 }
 
 /// A job's state within the queue.
@@ -216,6 +216,14 @@ pub struct JobMeta {
     /// one or the other we allow the delay to be stored in either [`JobState`] as primary data or
     /// here in `JobMeta` as secondary data depending on what the user wants.
     delay: Option<Delay>,
+}
+
+impl JobMeta {
+    /// Consumes this `JobMeta` and returns job metrics and the delay value
+    pub fn take(self) -> (JobMetrics, Option<Delay>) {
+        let Self { metrics, delay } = self;
+        (metrics, delay)
+    }
 }
 
 impl From<&Job> for JobMeta {

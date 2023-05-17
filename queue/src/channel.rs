@@ -97,43 +97,23 @@ impl Channel {
         }
     }
 
-    fn push_ready_impl<P: Into<Priority>>(&mut self, id: JobID, priority: P) {
-        let priority = priority.into();
-        trace!("Channel::push_ready_impl() -- push job {} with priority {}", id, priority);
-        self.ready_mut().insert((priority, id));
+    fn push_ready_impl(&mut self, job_id: JobID, priority: Priority) {
+        self.ready_mut().insert((priority, job_id));
         *self.metrics_mut().ready_mut() = self.ready().len() as u64;
         if priority < 1024.into() {
             *self.metrics_mut().urgent_mut() += 1;
         }
     }
 
-    fn push_delayed_impl<P, D>(&mut self, id: JobID, priority: P, delay: D)
-        where P: Into<Priority>,
-              D: Into<Delay>,
-    {
-        let delay = delay.into();
-        let priority = priority.into();
-        trace!("Channel::push_delayed_impl() -- push job {} with priority {} delay {}", id, priority, delay);
+    fn push_delayed_impl(&mut self, job_id: JobID, priority: Priority, delay: Delay) {
         let entry = self.delayed.entry(delay).or_insert_with(|| Vec::with_capacity(1));
-        (*entry).push(Some((id, priority)));
+        (*entry).push(Some((job_id, priority)));
         *self.metrics_mut().delayed_mut() += 1;
     }
 
-    /// Push a job into this channel's queue. It can be given an optional delay value (a ms
-    /// timestamp) that will delay processing of that job until the delay passes.
-    #[tracing::instrument(skip(self))]
-    pub fn push<P, D>(&mut self, id: JobID, priority: P, delay: Option<D>)
-        where P: Into<Priority> + std::fmt::Debug,
-              D: Into<Delay> + std::fmt::Debug,
-    {
-        if let Some(delay) = delay {
-            self.push_delayed_impl(id, priority, delay);
-            self.event(ChannelMod::Delayed);
-        } else {
-            self.push_ready_impl(id, priority.into());
-            self.event(ChannelMod::Ready);
-        }
-        *self.metrics_mut().total_mut() += 1;
+    fn push_failed_impl(&mut self, job_id: JobID, fail_id: FailID, priority: Priority) {
+        self.failed_mut().insert(fail_id, (job_id, priority));
+        *self.metrics_mut().failed_mut() = self.failed().len() as u64;
     }
 
     fn reserve_impl(&mut self, job_id: JobID, priority: Priority) {
@@ -144,6 +124,42 @@ impl Channel {
             *self.metrics_mut().urgent_mut() -= 1;
         }
         self.event(ChannelMod::Reserved);
+    }
+
+    /// Takes a few arguments about a job and puts it into the correct location (ready,
+    /// failed, delayed) based on its state. This is mainly useful for restoring from the
+    /// storage system.
+    pub(crate) fn restore(&mut self, job_id: JobID, priority: Priority, delay: Option<Delay>, fail_id: Option<FailID>) {
+        match (fail_id, delay) {
+            (Some(fail_id), _) => {
+                self.push_failed_impl(job_id, fail_id, priority);
+            }
+            (_, Some(delay)) => {
+                self.push_delayed_impl(job_id, priority, delay);
+            }
+            (_, None) => {
+                self.push_ready_impl(job_id, priority);
+            }
+        }
+    }
+
+    /// Push a job into this channel's queue. It can be given an optional delay value (a ms
+    /// timestamp) that will delay processing of that job until the delay passes.
+    #[tracing::instrument(skip(self))]
+    pub fn push<P, D>(&mut self, id: JobID, priority: P, delay: Option<D>)
+        where P: Into<Priority> + std::fmt::Debug,
+              D: Into<Delay> + std::fmt::Debug,
+    {
+        let priority = priority.into();
+        let delay = delay.map(|x| x.into());
+        if let Some(delay) = delay {
+            self.push_delayed_impl(id, priority, delay);
+            self.event(ChannelMod::Delayed);
+        } else {
+            self.push_ready_impl(id, priority);
+            self.event(ChannelMod::Ready);
+        }
+        *self.metrics_mut().total_mut() += 1;
     }
 
     /// Reserve the next available job
@@ -180,6 +196,7 @@ impl Channel {
         let priority = priority
             .map(|x| x.into())
             .unwrap_or_else(|| existing);
+        let delay = delay.map(|x| x.into());
         if let Some(delay) = delay {
             self.push_delayed_impl(id, priority, delay);
             self.event(ChannelMod::Delayed);
@@ -252,13 +269,10 @@ impl Channel {
 
     /// Fail a reserved job.
     #[tracing::instrument(skip(self))]
-    pub fn fail_reserved(&mut self, fail_id: FailID, id: JobID) -> Option<JobID> {
-        let priority = self.reserved_mut().remove(&id)?;
-        let job_ref = (id, priority);
-        let job_id = job_ref.0.clone();
-        self.failed_mut().insert(fail_id, job_ref);
+    pub fn fail_reserved(&mut self, fail_id: FailID, job_id: JobID) -> Option<JobID> {
+        let priority = self.reserved_mut().remove(&job_id)?;
+        self.push_failed_impl(job_id, fail_id, priority);
         *self.metrics_mut().reserved_mut() = self.reserved().len() as u64;
-        *self.metrics_mut().failed_mut() = self.failed().len() as u64;
         self.event(ChannelMod::Failed);
         Some(job_id)
     }
@@ -448,6 +462,79 @@ mod tests {
             assert_eq!($channel.metrics().failed(), $num_failed);
             assert_eq!($channel.metrics().total(), $num_total);
         }
+    }
+
+    #[test]
+    fn restore() {
+        let mut channel = Channel::new();
+        assert_counts!(&channel, 0, 0, 0, 0, 0, 0, 0);
+
+        channel.restore(JobID::from(1000), 1024.into(), None, None);
+        assert_counts!(&channel, 0, 1, 0, 0, 0, 0, 0);
+        channel.restore(JobID::from(1001), 1000.into(), None, None);
+        assert_counts!(&channel, 1, 2, 0, 0, 0, 0, 0);
+        channel.restore(JobID::from(1002), 1024.into(), Some(5000.into()), Some(FailID::from(1)));
+        assert_counts!(&channel, 1, 2, 0, 0, 0, 1, 0);
+        channel.restore(JobID::from(1003), 1024.into(), Some(5000.into()), None);
+        assert_counts!(&channel, 1, 2, 0, 1, 0, 1, 0);
+
+        let res1 = channel.reserve_next().unwrap();
+        assert_eq!(res1, JobID::from(1001));
+        assert_counts!(&channel, 0, 1, 1, 1, 0, 1, 0);
+        let res2 = channel.reserve_next().unwrap();
+        assert_eq!(res2, JobID::from(1000));
+        assert_counts!(&channel, 0, 0, 2, 1, 0, 1, 0);
+        let res3 = channel.reserve_next();
+        assert_eq!(res3, None);
+        assert_counts!(&channel, 0, 0, 2, 1, 0, 1, 0);
+        assert_eq!(channel.expire_delayed(&5000.into()), vec![JobID::from(1003)]);
+        assert_counts!(&channel, 0, 1, 2, 0, 0, 1, 0);
+        let res4 = channel.reserve_next().unwrap();
+        assert_eq!(res4, JobID::from(1003));
+        assert_counts!(&channel, 0, 0, 3, 0, 0, 1, 0);
+        assert_eq!(channel.kick_jobs_failed(10), vec![JobID::from(1002)]);
+        assert_counts!(&channel, 0, 1, 3, 0, 0, 0, 0);
+        let res5 = channel.reserve_next().unwrap();
+        assert_eq!(res5, JobID::from(1002));
+        assert_counts!(&channel, 0, 0, 4, 0, 0, 0, 0);
+        assert_eq!(channel.reserve_next(), None);
+        assert_counts!(&channel, 0, 0, 4, 0, 0, 0, 0);
+    }
+
+    #[test]
+    fn restore_dupe() {
+        let mut channel2 = Channel::new();
+        assert_counts!(&channel2, 0, 0, 0, 0, 0, 0, 0);
+        // duplicate ready jobs should NOT update counts
+        channel2.restore(JobID::from(1000), 1024.into(), None, None);
+        channel2.restore(JobID::from(1000), 1024.into(), None, None);
+        channel2.restore(JobID::from(1000), 1024.into(), None, None);
+        channel2.restore(JobID::from(1000), 1024.into(), None, None);
+        assert_counts!(&channel2, 0, 1, 0, 0, 0, 0, 0);
+        // duplicate delay jobs will update counts. this is expected.
+        channel2.restore(JobID::from(1001), 1024.into(), Some(5000.into()), None);
+        channel2.restore(JobID::from(1001), 1024.into(), Some(5000.into()), None);
+        channel2.restore(JobID::from(1001), 1024.into(), Some(5000.into()), None);
+        channel2.restore(JobID::from(1001), 1024.into(), Some(5000.into()), None);
+        channel2.restore(JobID::from(1001), 1024.into(), Some(5000.into()), None);
+        assert_counts!(&channel2, 0, 1, 0, 5, 0, 0, 0);
+        // we really don't care about deduping here
+        assert_eq!(channel2.expire_delayed(&5000.into()), vec![
+            JobID::from(1001),
+            JobID::from(1001),
+            JobID::from(1001),
+            JobID::from(1001),
+            JobID::from(1001),
+        ]);
+        assert_counts!(&channel2, 0, 2, 0, 0, 0, 0, 0);
+        // duplicate failed will not increase counts
+        channel2.restore(JobID::from(1002), 1024.into(), None, Some(FailID::from(2001)));
+        channel2.restore(JobID::from(1002), 1024.into(), None, Some(FailID::from(2001)));
+        channel2.restore(JobID::from(1002), 1024.into(), None, Some(FailID::from(2001)));
+        channel2.restore(JobID::from(1002), 1024.into(), None, Some(FailID::from(2001)));
+        assert_counts!(&channel2, 0, 2, 0, 0, 0, 1, 0);
+        assert_eq!(channel2.kick_jobs_failed(100), vec![JobID::from(1002)]);
+        assert_counts!(&channel2, 0, 3, 0, 0, 0, 0, 0);
     }
 
     #[test]

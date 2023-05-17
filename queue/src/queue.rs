@@ -5,7 +5,7 @@ use ahash::{RandomState};
 use crate::{
     channel::Channel,
     error::{Error, Result},
-    job::{Delay, Job, JobID, JobMeta, JobState, JobStatus, JobStore, Priority},
+    job::{Delay, FailID, Job, JobID, JobMeta, JobState, JobStatus, JobStore, Priority},
     ser,
 };
 use dashmap::DashMap;
@@ -74,8 +74,8 @@ impl std::fmt::Debug for Ordering {
 }
 
 /// Configured some options our queue might have
-#[derive(Builder, Debug, Default, Getters, MutGetters)]
-#[getset(get = "pub", get_mut)]
+#[derive(Builder, Debug, Default, Getters)]
+#[getset(get = "pub")]
 #[builder(pattern = "owned")]
 pub struct QueueConfig {
     /// If false (the default), stores job delays in the primary storage, making delays and
@@ -137,7 +137,8 @@ impl Queue {
                 .transpose()?;
             let job = Job::create_from_parts(job_id, store, meta);
             let (job_id, job_data, job_state) = job.take();
-            self.enqueue_impl(job_state.channel().clone(), job_id, job_data, job_state.priority().clone(), job_state.ttr().clone(), job_state.delay().clone())?;
+            let mut channel = self.channels().entry(job_state.channel().clone()).or_insert_with(|| Channel::new());
+            //channel.restore(job_id, job_state.priority().clone(), delay, job_state.status().
             counter += 1;
         }
         Ok(counter)
@@ -169,15 +170,6 @@ impl Queue {
         Ok(())
     }
 
-    /// Puts stuff into a channel without saving to DB. Good for restoring.
-    fn enqueue_impl(&self, channel_name: String, job_id: JobID, job_data: Vec<u8>, priority: Priority, ttr: u64, delay: Option<Delay>) -> Result<Job> {
-        let state = JobState::new(channel_name, priority, JobStatus::Ready, ttr, delay);
-        let job = Job::new(job_id.clone(), job_data, state);
-        let mut channel = self.channels().entry(job.state().channel().clone()).or_insert_with(|| Channel::new());
-        channel.push(job_id.clone(), priority, delay);
-        Ok(job)
-    }
-
     /// Push a new job into the queue.
     ///
     /// This puts the jobs into the given channel with the given priority/ttr. Optionally, a delay
@@ -191,9 +183,13 @@ impl Queue {
     {
         let job_id_val = self.db_primary().generate_id()?;
         let job_id = JobID::from(job_id_val);
-        let job = self.enqueue_impl(channel_name.into(), job_id, job_data, priority.into(), ttr, delay.map(|x| x.into()))?;
+        let state = JobState::new(channel_name.into(), priority, JobStatus::Ready, ttr, delay);
+        let job = Job::new(job_id.clone(), job_data, state);
+
         self.db_primary().insert(ser::serialize(&job_id)?, ser::serialize(&JobStore::from(&job))?)?;
         self.db_meta().insert(ser::serialize(&job_id)?, ser::serialize(&JobMeta::from(&job))?)?;
+        let mut channel = self.channels().entry(job.state().channel().clone()).or_insert_with(|| Channel::new());
+        channel.push(job_id.clone(), priority, delay);
 
         Ok(job.id().clone())
     }
@@ -346,16 +342,78 @@ impl Queue {
         Ok(released)
     }
 
-    /*
     /// Delete a job.
     ///
-    /// If the job is in the reserved
+    /// If the job is in the reserved state, the caller *must ensure* that the delete command
+    /// is originating from a connection where the job was originally reserved from. This logic
+    /// is not enforced at this level.
     #[tracing::instrument(skip(self))]
-    pub fn delete(&self, job_id: &JobID) -> Result<JobID> {
+    pub fn delete(&self, job_id: JobID) -> Result<Option<JobID>> {
         let job_id_ser = ser::serialize(&job_id)?;
-        let job_ser = self.db_primary
+        let job_ser = self.db_primary().get(&job_id_ser)?
+            .ok_or_else(|| Error::JobNotFound(job_id))?;
+        let mut job: JobStore = ser::deserialize(&job_ser)?;
+        let delay: Option<Delay> = if *self.config().delay_in_meta() {
+            self.db_meta().get(&job_id_ser)?
+                .map(|meta_ser| {
+                    ser::deserialize(&meta_ser)
+                })
+                .transpose()?
+                .and_then(|x: JobMeta| x.take().1)
+        } else {
+            job.state_mut().delay_mut().take()
+        };
+        let res = {
+            let mut channel = self.channels.get_mut(job.state().channel())
+                .ok_or_else(|| Error::JobNotFound(job_id))?;
+            match (job.state().status(), delay) {
+                (JobStatus::Failed(fail_id, ..), _) => {
+                    channel.delete_failed(fail_id.clone())
+                }
+                (_, Some(delay)) => {
+                    channel.delete_delayed(delay, job_id)
+                }
+                (_, None) => {
+                    if channel.reserved().contains_key(&job_id) {
+                        channel.delete_reserved(job_id)
+                    } else {
+                        channel.delete_ready(job.state().priority().clone(), job_id)
+                    }
+                }
+            }
+        };
+        if res.is_some() {
+            self.db_primary().remove(&job_id_ser)?;
+            self.db_meta().remove(&job_id_ser)?;
+        }
+        Ok(res)
     }
-    */
+
+    /// Fail a reserved job.
+    ///
+    /// The caller *must ensure* that the delete command is originating from a connection
+    /// where the job was originally reserved from. This logic is not enforced at this level.
+    #[tracing::instrument(skip(self))]
+    pub fn fail_reserved(&self, job_id: JobID, faildata: Option<Vec<u8>>) -> Result<Option<JobID>> {
+        let job_id_ser = ser::serialize(&job_id)?;
+        let job_ser = self.db_primary().get(&job_id_ser)?
+            .ok_or_else(|| Error::JobNotFound(job_id))?;
+        let mut job: JobStore = ser::deserialize(&job_ser)?;
+        let res = {
+            let mut channel = self.channels.get_mut(job.state().channel())
+                .ok_or_else(|| Error::JobNotFound(job_id))?;
+            let fail_id = FailID::from(self.db_primary().generate_id()?);
+            match channel.fail_reserved(fail_id.clone(), job_id) {
+                Some(job_id) => {
+                    *job.state_mut().status_mut() = JobStatus::Failed(fail_id, faildata);
+                    self.db_primary().insert(&job_id_ser, ser::serialize(&job)?)?;
+                    Some(job_id)
+                }
+                None => None,
+            }
+        };
+        Ok(res)
+    }
 
     #[cfg(test)]
     /// Consume the queue and return the internal databases. For testing mainly.
@@ -460,13 +518,17 @@ mod tests {
         let queue1 = make_queue(32);
         let job1 = queue1.enqueue("jobs", Vec::from("do stuff".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         let job2 = queue1.enqueue("jobs", Vec::from("do something".as_bytes()), 0, 300, None::<Delay>).unwrap();
-        let job3 = queue1.enqueue("jobs", Vec::from("do later".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        let job4 = queue1.enqueue("todo", Vec::from("make todo list".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("jobs", Vec::from("do something else".as_bytes()), 0, 300, None::<Delay>).unwrap();
+        let job4 = queue1.enqueue("jobs", Vec::from("do later".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job5 = queue1.enqueue("todo", Vec::from("make todo list".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         // "i have done that," said toad
-        let job5 = queue1.enqueue("todo", Vec::from("wake up".as_bytes()), 1024, 300, Some(4000)).unwrap();
+        let job6 = queue1.enqueue("todo", Vec::from("wake up".as_bytes()), 1024, 300, Some(4000)).unwrap();
         for i in 0..9000 {
             queue1.enqueue("chain", Vec::from(format!("send this queue to {} people or else", i).as_bytes()), 2000, 300, None::<Delay>).unwrap();
         }
+        let deq1 = queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        assert_eq!(deq1.id(), &job2);
+        queue1.fail_reserved(deq1.id().clone(), Some(vec![1, 2, 3])).unwrap().unwrap();
 
         let (db1_p, db1_m) = queue1.take_db();
         let queue2 = Queue::new(QueueConfigBuilder::default().build().unwrap(), db1_p, db1_m, 32).unwrap();
@@ -479,7 +541,7 @@ mod tests {
         let deq3 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         let deq4 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         let deq5 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
-        assert_eq!(deq1.unwrap().id(), &job2);
+        assert_eq!(deq1.unwrap().id(), &job3);
         assert_eq!(deq2.unwrap().id(), &job1);
         assert_eq!(deq3.unwrap().id(), &job4);
         assert_eq!(deq4.as_ref().map(|x| x.id()), None);
@@ -660,6 +722,57 @@ mod tests {
         assert_eq!(job3.data(), &Vec::from("process-vid2".as_bytes()));
         assert_eq!(job3.metrics().reserves(), 2);
         assert_eq!(job3.metrics().releases(), 1);
+    }
+
+    #[test]
+    fn delete() {
+        let queue1 = make_queue(32);
+        let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("vidz", Vec::from("edit".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job3 = queue1.enqueue("vidz", Vec::from("watch".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+
+        let deq1 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+        let deq2 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+    }
+
+    #[test]
+    fn fail_reserved() {
+        let queue1 = make_queue(32);
+        let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("vidz", Vec::from("edit".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job3 = queue1.enqueue("vidz", Vec::from("watch".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+
+        assert_eq!(queue1.fail_reserved(job1, None).unwrap(), None);
+        assert_eq!(queue1.fail_reserved(job2, None).unwrap(), None);
+        assert_eq!(queue1.fail_reserved(job3, None).unwrap(), None);
+        assert_eq!(queue1.fail_reserved(job4, None).unwrap(), None);
+        assert_eq!(queue1.fail_reserved(job5, None).unwrap(), None);
+
+        let deq1 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+        let deq2 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+        let deq3 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+
+        assert_eq!(queue1.fail_reserved(job1, None).unwrap(), Some(job1.clone()));
+        assert_eq!(queue1.fail_reserved(job2, None).unwrap(), None);
+        assert_eq!(queue1.fail_reserved(job3, None).unwrap(), Some(job3.clone()));
+        assert_eq!(queue1.fail_reserved(job4, None).unwrap(), Some(job4.clone()));
+        assert_eq!(queue1.fail_reserved(job5, None).unwrap(), None);
+        {
+            let chan = queue1.channels().get("vidz").unwrap();
+            assert_eq!(chan.failed().len(), 3);
+        }
+
+        let (db1_p, db1_m) = queue1.take_db();
+        let queue2 = Queue::new(QueueConfigBuilder::default().build().unwrap(), db1_p, db1_m, 32).unwrap();
+        queue2.restore().unwrap();
+        {
+            let chan = queue2.channels().get("vidz").unwrap();
+            assert_eq!(chan.failed().len(), 3);
+        }
     }
 }
 
