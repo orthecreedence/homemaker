@@ -18,9 +18,9 @@ pub enum Error {
     #[error("Error locking a channel: {0}")]
     ChannelLockError(String),
 
-    /// Error sending on a channel
-    #[error("Error sending on a channel: {0}")]
-    ChannelMessageError(String),
+    /// Channel not found
+    #[error("That channel wasn't found: {0}")]
+    ChannelNotFound(String),
 
     /// That job wasn't found
     #[error("Job not found: {0}")]

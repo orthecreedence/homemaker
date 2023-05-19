@@ -13,7 +13,7 @@ use crate::{
 use crossbeam_channel::{self, Sender, Receiver};
 use getset::{CopyGetters, Getters, MutGetters};
 use std::collections::{BTreeMap, BTreeSet};
-use tracing::{trace, info};
+use tracing::{info};
 
 #[derive(Clone, Debug, Default, CopyGetters, MutGetters)]
 #[getset(get_copy = "pub", get_mut)]

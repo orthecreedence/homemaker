@@ -15,32 +15,9 @@ use sled::Db;
 use std::sync::{Mutex};
 use tracing::{warn};
 
-/// A handy macro to wrap some gibberish around updating inline stats in our db.
-macro_rules! update_meta {
-    ($db:expr, $job_id:expr, $meta:ident, $op:block) => {
-        $db
-            .update_and_fetch(ser::serialize($job_id)?, |old| {
-                let meta = match old {
-                    Some(bytes) => {
-                        let mut $meta = match ser::deserialize::<JobMeta>(bytes) {
-                            Ok(meta) => meta,
-                            // can't deal with errors here so we just ignore.
-                            // it's only stats, after all...
-                            Err(_) => return Some(Vec::from(bytes)),
-                        };
-                        $op
-                        Some($meta)
-                    }
-                    None => None,
-                };
-                meta
-                    .map(|x| ser::serialize(&x))
-                    .transpose()
-                    .unwrap_or_else(|_| old.map(|x| Vec::from(x)))
-            })?
-            .map(|x| ser::deserialize::<JobMeta>(x.as_ref()))
-            .transpose()?
-    }
+/// A handy macro to convert serializable things into storage keys.
+macro_rules! to_key {
+    ($job_id:expr) => { ser::serialize($job_id) }
 }
 
 /// Defines guarantees for [dequeuing][Queue::dequeue] jobs *from multiple channels*.
@@ -135,13 +112,76 @@ impl Queue {
             let meta: Option<JobMeta> = self.db_meta().get(&job_id_ser)?
                 .map(|x| ser::deserialize(&x))
                 .transpose()?;
-            let job = Job::create_from_parts(job_id, store, meta);
-            let (job_id, job_data, job_state) = job.take();
+            let job = Job::create_from_parts(job_id, store, meta, *self.config().delay_in_meta());
+            let (job_id, _job_data, job_state) = job.take();
             let mut channel = self.channels().entry(job_state.channel().clone()).or_insert_with(|| Channel::new());
-            //channel.restore(job_id, job_state.priority().clone(), delay, job_state.status().
+            let fail_id_maybe = match job_state.status() {
+                JobStatus::Failed(ref fail_id, ..) => Some(fail_id.clone()),
+                _ => None,
+            };
+            channel.restore(job_id, job_state.priority().clone(), job_state.delay().clone(), fail_id_maybe);
             counter += 1;
         }
         Ok(counter)
+    }
+
+    /// Runs an update function on the state of the given job.
+    fn update_and_save_store<T, F>(&self, job_id_ser: T, op: F) -> Result<Option<JobStore>>
+        where T: AsRef<[u8]>,
+              F: Fn(&mut JobStore),
+    {
+        self.db_primary()
+            .update_and_fetch(job_id_ser, |old| {
+                let store = match old {
+                    Some(bytes) => {
+                        match ser::deserialize::<JobStore>(bytes) {
+                            Ok(mut store) => {
+                                op(&mut store);
+                                Some(store)
+                            }
+                            // can't deal with errors here so we just ignore.
+                            // it's only stats, after all...
+                            Err(_) => None,
+                        }
+                    }
+                    None => None,
+                };
+                store
+                    .map(|x| ser::serialize(&x))
+                    .transpose()
+                    .unwrap_or_else(|_| old.map(|x| Vec::from(x)))
+            })?
+            .map(|x| ser::deserialize::<JobStore>(x.as_ref()))
+            .transpose()
+    }
+
+    /// Runs an update function on the meta of the given job.
+    fn update_and_save_meta<T, F>(&self, job_id_ser: T, op: F) -> Result<Option<JobMeta>>
+        where T: AsRef<[u8]>,
+              F: Fn(&mut JobMeta),
+    {
+        self.db_meta()
+            .update_and_fetch(job_id_ser, |old| {
+                let meta = match old {
+                    Some(bytes) => {
+                        let mut meta = match ser::deserialize::<JobMeta>(bytes) {
+                            Ok(meta) => meta,
+                            // can't deal with errors here so we just ignore.
+                            // it's only stats, after all...
+                            Err(_) => return Some(Vec::from(bytes)),
+                        };
+                        op(&mut meta);
+                        Some(meta)
+                    }
+                    None => None,
+                };
+                meta
+                    .map(|x| ser::serialize(&x))
+                    .transpose()
+                    .unwrap_or_else(|_| old.map(|x| Vec::from(x)))
+            })?
+            .map(|x| ser::deserialize::<JobMeta>(x.as_ref()))
+            .transpose()
     }
 
     /// Expires delayed jobs that have passed their time. Takes a `now` value which basically
@@ -160,12 +200,7 @@ impl Queue {
             expired.append(&mut expired_loc);
         }
         for job_id in expired {
-            update_meta! {
-                self.db_meta(),
-                &job_id,
-                meta,
-                { *meta.delay_mut() = None; }
-            };
+            self.update_and_save_meta(to_key!(&job_id)?, |meta| *meta.delay_mut() = None)?;
         }
         Ok(())
     }
@@ -208,16 +243,14 @@ impl Queue {
             let maybe_job = channel.reserve_next();
             match maybe_job {
                 Some(job_id) => {
-                    match self.db_primary().get(ser::serialize(&job_id)?)? {
+                    let job_id_ser = to_key!(&job_id)?;
+                    match self.db_primary().get(&job_id_ser)? {
                         Some(store_bytes) => {
                             let store = ser::deserialize(store_bytes.as_ref())?;
-                            let meta = update_meta! {
-                                self.db_meta(),
-                                &job_id,
-                                meta,
-                                { *meta.metrics_mut().reserves_mut() += 1 }
-                            };
-                            let job = Job::create_from_parts(job_id, store, meta);
+                            let meta = self.update_and_save_meta(&job_id_ser, |meta| {
+                                *meta.metrics_mut().reserves_mut() += 1;
+                            })?;
+                            let job = Job::create_from_parts(job_id, store, meta, *self.config().delay_in_meta());
                             Ok(Some(job))
                         }
                         None => Ok(None),
@@ -299,13 +332,10 @@ impl Queue {
             Some(mut chan) => {
                 match chan.reserve_job(job_store.state().priority().clone(), job_id.clone()) {
                     Some(_) => {
-                        let job_meta = update_meta! {
-                            self.db_meta(),
-                            &job_id,
-                            meta,
-                            { *meta.metrics_mut().reserves_mut() += 1 }
-                        };
-                        let job = Job::create_from_parts(job_id, job_store, job_meta);
+                        let job_meta = self.update_and_save_meta(&job_id_ser, |meta| {
+                            *meta.metrics_mut().reserves_mut() += 1;
+                        })?;
+                        let job = Job::create_from_parts(job_id, job_store, job_meta, *self.config().delay_in_meta());
                         Ok(Some(job))
                     }
                     None => Ok(None),
@@ -316,6 +346,9 @@ impl Queue {
     }
 
     /// Release a job we previously reserved back into the queue, allowing others to process it.
+    ///
+    /// It is the responsibility of the caller to ensure that this release command is happening
+    /// on the same connection the job is reserved on.
     #[tracing::instrument(skip(self))]
     pub fn release<P, D>(&self, job_id: &JobID, priority: P, delay: Option<D>) -> Result<JobID>
         where P: Into<Priority> + std::fmt::Debug,
@@ -329,16 +362,13 @@ impl Queue {
         let mut channel = self.channels().get_mut(channel_name)
             .ok_or_else(|| {
                 warn!("Queue.release() -- job {0} found but channel {1} (found in {0}'s data) is missing. curious.", job_id, channel_name);
-                Error::JobNotFound(job_id.clone())
+                Error::ChannelNotFound(channel_name.clone())
             })?;
         let released = channel.release(job_id.clone(), Some(priority), delay)
             .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
-        update_meta! {
-            self.db_meta(),
-            &released,
-            meta,
-            { *meta.metrics_mut().releases_mut() += 1 }
-        };
+        self.update_and_save_meta(to_key!(&released)?, |meta| {
+            *meta.metrics_mut().releases_mut() += 1;
+        })?;
         Ok(released)
     }
 
@@ -365,7 +395,10 @@ impl Queue {
         };
         let res = {
             let mut channel = self.channels.get_mut(job.state().channel())
-                .ok_or_else(|| Error::JobNotFound(job_id))?;
+                .ok_or_else(|| {
+                    warn!("Queue.delete() -- job {0} found but channel {1} (found in {0}'s data) is missing. curious.", job_id, job.state().channel());
+                    Error::ChannelNotFound(job.state().channel().clone())
+                })?;
             match (job.state().status(), delay) {
                 (JobStatus::Failed(fail_id, ..), _) => {
                     channel.delete_failed(fail_id.clone())
@@ -398,21 +431,45 @@ impl Queue {
         let job_id_ser = ser::serialize(&job_id)?;
         let job_ser = self.db_primary().get(&job_id_ser)?
             .ok_or_else(|| Error::JobNotFound(job_id))?;
-        let mut job: JobStore = ser::deserialize(&job_ser)?;
+        let job: JobStore = ser::deserialize(&job_ser)?;
         let res = {
             let mut channel = self.channels.get_mut(job.state().channel())
                 .ok_or_else(|| Error::JobNotFound(job_id))?;
             let fail_id = FailID::from(self.db_primary().generate_id()?);
             match channel.fail_reserved(fail_id.clone(), job_id) {
                 Some(job_id) => {
-                    *job.state_mut().status_mut() = JobStatus::Failed(fail_id, faildata);
-                    self.db_primary().insert(&job_id_ser, ser::serialize(&job)?)?;
+                    let new_status = JobStatus::Failed(fail_id, faildata);
+                    self.update_and_save_store(to_key!(&job_id)?, |store| {
+                        // this clone makes me sad, but not doing it would require
+                        //
+                        // - implementing some sort of borrow-based store object
+                        // - directly writing into db_primary which might overwrite other
+                        //   concurrent updates
+                        *store.state_mut().status_mut() = new_status.clone();
+                    })?;
                     Some(job_id)
                 }
                 None => None,
             }
         };
         Ok(res)
+    }
+
+    /// Kick N jobs on the given channel, returning the job ids of the kicked jobs.
+    ///
+    /// If the channel has ANY failed jobs, we kick N failed and return. If the channel has NO
+    /// failed jobs, then we kick N delayed jobs and return.
+    #[tracing::instrument(skip(self))]
+    pub fn kick(&self, channel: &str, num: usize) -> Result<Vec<JobID>> {
+        unimplemented!();
+    }
+
+    /// Kick a specific job on the given channel, returning the kicked job id.
+    ///
+    /// If the job is failed or delayed, we kick it, otherwise we do nussing, Lebowski.
+    #[tracing::instrument(skip(self))]
+    pub fn kick_job(&self, channel: &str, num: usize) -> Result<Option<JobID>> {
+        unimplemented!();
     }
 
     #[cfg(test)]
@@ -543,14 +600,14 @@ mod tests {
         let deq5 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         assert_eq!(deq1.unwrap().id(), &job3);
         assert_eq!(deq2.unwrap().id(), &job1);
-        assert_eq!(deq3.unwrap().id(), &job4);
+        assert_eq!(deq3.unwrap().id(), &job5);
         assert_eq!(deq4.as_ref().map(|x| x.id()), None);
         assert_eq!(deq5.as_ref().map(|x| x.id()), None);
         queue2.expire_delayed(5000).unwrap();
         let deq6 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         let deq7 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
-        assert_eq!(deq6.unwrap().id(), &job3);
-        assert_eq!(deq7.unwrap().id(), &job5);
+        assert_eq!(deq6.unwrap().id(), &job4);
+        assert_eq!(deq7.unwrap().id(), &job6);
         let deq8 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         assert_eq!(deq8.as_ref().map(|x| x.id()), None);
 
@@ -729,12 +786,24 @@ mod tests {
         let queue1 = make_queue(32);
         let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         let job2 = queue1.enqueue("vidz", Vec::from("edit".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        let job3 = queue1.enqueue("vidz", Vec::from("watch".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("vidz", Vec::from("show".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Delay>).unwrap();
         let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Delay>).unwrap();
 
-        let deq1 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
-        let deq2 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+        queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
+        let deq2 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
+        queue1.fail_reserved(deq2.id().clone(), Some(vec![6, 9, 6, 9])).unwrap().unwrap();
+        queue1.delete(job1).unwrap().unwrap();
+        queue1.delete(job2).unwrap().unwrap();
+        queue1.delete(job3).unwrap().unwrap();
+        queue1.delete(job4).unwrap().unwrap();
+        queue1.delete(job5).unwrap().unwrap();
+        assert!(matches!(queue1.delete(job1), Err(Error::JobNotFound(_))));
+        assert!(matches!(queue1.delete(job2), Err(Error::JobNotFound(_))));
+        assert!(matches!(queue1.delete(job3), Err(Error::JobNotFound(_))));
+        assert!(matches!(queue1.delete(job4), Err(Error::JobNotFound(_))));
+        assert!(matches!(queue1.delete(job5), Err(Error::JobNotFound(_))));
+        assert_eq!(queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().as_ref().map(|x| x.id()), None);
     }
 
     #[test]
@@ -751,10 +820,14 @@ mod tests {
         assert_eq!(queue1.fail_reserved(job3, None).unwrap(), None);
         assert_eq!(queue1.fail_reserved(job4, None).unwrap(), None);
         assert_eq!(queue1.fail_reserved(job5, None).unwrap(), None);
+        {
+            let chan = queue1.channels().get("vidz").unwrap();
+            assert_eq!(chan.failed().len(), 0);
+        }
 
-        let deq1 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
-        let deq2 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
-        let deq3 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap();
+        queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
+        queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
+        queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
 
         assert_eq!(queue1.fail_reserved(job1, None).unwrap(), Some(job1.clone()));
         assert_eq!(queue1.fail_reserved(job2, None).unwrap(), None);

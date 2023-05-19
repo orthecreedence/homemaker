@@ -162,19 +162,15 @@ impl Job {
     /// Take a job id, store, and an optional meta and return a Job.
     ///
     /// Heyyyy, man. You got a job!
-    pub fn create_from_parts(id: JobID, store: JobStore, meta: Option<JobMeta>) -> Self {
+    pub fn create_from_parts(id: JobID, store: JobStore, meta: Option<JobMeta>, delay_in_meta: bool) -> Self {
         let JobStore { data, state } = store;
         let mut job = Self::new(id, data, state);
         if let Some(meta) = meta {
             job.metrics = meta.metrics;
-            // here we "merge" delay values. since meta is almost *always* written after
-            // state data, we just assume that if there's a delay in meta, it should
-            // overwrite the state delay.
-            match (job.state.delay, meta.delay) {
-                (None, Some(delay)) => {
+            if delay_in_meta {
+                if let Some(delay) = meta.delay {
                     job.state.delay = Some(delay);
                 }
-                _ => {}
             }
         }
         job
