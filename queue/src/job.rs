@@ -53,7 +53,7 @@ macro_rules! wrapper_primitive {
 
 wrapper_primitive! {
     /// Holds a priority value
-    Priority, u16
+    Priority, u32
 }
 
 wrapper_primitive! {
