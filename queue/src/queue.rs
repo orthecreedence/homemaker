@@ -115,19 +115,22 @@ impl Queue {
         Ok(counter)
     }
 
-    /// Expires delayed jobs that have passed their time. Takes a `now` value which basically
-    /// tells us what time it is (same format as delay values: unix timestamp in ms).
-    #[tracing::instrument(skip(self))]
-    pub fn expire_delayed<D>(&self, now: D) -> Result<()>
+    /// Loop over our channels and perform any needed maintenance (pausing, expiring delayed
+    /// jobs, etc).
+    pub fn tick<D>(&self, now: D) -> Result<()>
         where D: Into<Delay> + Copy + std::fmt::Debug,
     {
         let now = now.into();
         let mut expired = Vec::new();
         for mut chan in self.channels().iter_mut() {
+            // unpause the channel if its pause expiration is nigh
+            chan.update_paused(&now);
+
+            // expire any delayed jobs, moving them into ready, returning their ids.
             let mut expired_loc = chan.value_mut().expire_delayed(&now);
             // instead of handling the updating of the jobs in storage here, we push whatever
-            // jobs we got onto the big todo list and keep going. want to keep these locks
-            // for as short as possible.
+            // jobs we got onto the big todo list and keep going. want to keep these channel
+            // locks open for as short as possible.
             expired.append(&mut expired_loc);
         }
         for job_id in expired {
@@ -532,7 +535,7 @@ mod tests {
         assert_eq!(deq3.unwrap().id(), &job5);
         assert_eq!(deq4.as_ref().map(|x| x.id()), None);
         assert_eq!(deq5.as_ref().map(|x| x.id()), None);
-        queue2.expire_delayed(5000).unwrap();
+        queue2.tick(5000).unwrap();
         let deq6 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         let deq7 = queue2.dequeue(&vec!["jobs".into(), "todo".into()], Ordering::Strict).unwrap();
         assert_eq!(deq6.unwrap().id(), &job4);
