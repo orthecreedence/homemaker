@@ -202,60 +202,10 @@ impl Queue {
         let chanlen = channels.len();
         if chanlen == 0 {
             Err(Error::ChannelListEmpty)
-        } else if chanlen == 1 {
-            // no need to deal with dumb locking or scanning or w/e if our channel list is len 1
-            match self.channels().get_mut(&channels[0]) {
-                Some(mut chan) => {
-                    reserve_from_channel(chan.value_mut())
-                }
-                None => Ok(None),
-            }
         } else {
-            let lock = match ordering {
-                Ordering::Strict | Ordering::StrictOp(_) => {
-                    let handle = match self.dequeue_lock().lock() {
-                        Ok(x) => x,
-                        Err(e) => Err(Error::ChannelLockError(format!("{:?}", e)))?,
-                    };
-                    Some(handle)
-                }
-                _ => None,
-            };
-            // loop over our channels one by one, peeking jobs and at the end we'll reserve from
-            // the chan with the lowest priority/job_id. not perfect because there's a chance
-            // the channel we pick will have gotten that job reserved by the time we finish.
-            let mut lowest = None;
-            for chan in channels {
-                let maybe_job = self.channels().get_mut(chan).as_ref()
-                    .and_then(|c| c.peek_ready().clone());
-                match (lowest, maybe_job) {
-                    (None, Some((pri, id))) => {
-                        lowest = Some((pri, id, chan));
-                    }
-                    (Some(pair1), Some((pri, id))) => {
-                        let comp = (pri, id, chan);
-                        if comp < pair1 {
-                            lowest = Some(comp);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let ret = if let Some(chan) = lowest.map(|x| x.2) {
-                match self.channels().get_mut(chan) {
-                    Some(mut chan) => {
-                        reserve_from_channel(chan.value_mut())
-                    }
-                    None => Ok(None),
-                }
-            } else {
-                Ok(None)
-            };
-            if let Ordering::StrictOp(mut op) = ordering {
-                op();
-            }
-            drop(lock);
-            ret
+            self.select_channel(channels, ordering, |chan| {
+                reserve_from_channel(chan)
+            })
         }
     }
 
@@ -401,6 +351,69 @@ impl Queue {
     #[tracing::instrument(skip(self))]
     pub fn kick_job(&self, channel: &str, num: usize) -> Result<Option<JobID>> {
         unimplemented!();
+    }
+
+    /// Given a list of channels and an ordering value, finds the channel with the
+    /// next job having the highest priority and passes it as a &mut Channel into
+    /// `op`.
+    fn select_channel<T, F>(&self, channels: &Vec<String>, ordering: Ordering, op: F) -> Result<Option<T>>
+        where F: FnOnce(&mut Channel) -> Result<Option<T>>,
+    {
+        if channels.len() == 1 {
+            // no need to deal with dumb locking or scanning or w/e if our channel list is len 1
+            return match self.channels().get_mut(&channels[0]) {
+                Some(mut chan) => {
+                    op(chan.value_mut())
+                }
+                None => Ok(None),
+            };
+        }
+
+        let lock = match ordering {
+            Ordering::Strict | Ordering::StrictOp(_) => {
+                let handle = match self.dequeue_lock().lock() {
+                    Ok(x) => x,
+                    Err(e) => Err(Error::ChannelLockError(format!("{:?}", e)))?,
+                };
+                Some(handle)
+            }
+            _ => None,
+        };
+        // loop over our channels one by one, peeking jobs and at the end we'll reserve from
+        // the chan with the lowest priority/job_id. not perfect because there's a chance
+        // the channel we pick will have gotten that job reserved by the time we finish.
+        let mut lowest = None;
+        for chan in channels {
+            let maybe_job = self.channels().get_mut(chan).as_ref()
+                .and_then(|c| c.peek_ready().clone());
+            match (lowest, maybe_job) {
+                (None, Some((pri, id))) => {
+                    lowest = Some((pri, id, chan));
+                }
+                (Some(pair1), Some((pri, id))) => {
+                    let comp = (pri, id, chan);
+                    if comp < pair1 {
+                        lowest = Some(comp);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ret = if let Some(chan) = lowest.map(|x| x.2) {
+            match self.channels().get_mut(chan) {
+                Some(mut chan) => {
+                    op(chan.value_mut())
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        };
+        if let Ordering::StrictOp(mut op) = ordering {
+            op();
+        }
+        drop(lock);
+        ret
     }
 
     #[cfg(test)]
