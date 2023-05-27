@@ -34,6 +34,8 @@ pub struct ChannelMetrics {
     total: u64,
     /// Number of active subscribers
     subscribers: u64,
+    /// Number of times we've paused this naughty little channel
+    cmd_pause: u64,
 }
 
 /// A collection of modifications that can happen to a job on a channel, mainly used when
@@ -69,6 +71,11 @@ pub struct Channel {
     delayed: BTreeMap<Delay, Vec<Option<(JobID, Priority)>>>,
     /// Failed jobs, stored FIFO
     failed: BTreeMap<FailID, (JobID, Priority)>,
+    /// Is our heroic channel paused? This means all reserves should return `None` until the
+    /// stored delay value lapses. Keep in mind, the channel itself doesn't track time, so it's
+    /// up to the implementor to call [`Channel::update_paused`] periodically with the current
+    /// time.
+    paused: Option<(Delay, Delay)>,
     /// Our heroic channel metrics
     metrics: ChannelMetrics,
 }
@@ -84,6 +91,7 @@ impl Channel {
             reserved: Default::default(),
             delayed: Default::default(),
             failed: Default::default(),
+            paused: None,
             metrics: Default::default(),
         }
     }
@@ -165,6 +173,9 @@ impl Channel {
     /// Reserve the next available job
     #[tracing::instrument(skip(self))]
     pub fn reserve_next(&mut self) -> Option<JobID> {
+        if self.paused().is_some() {
+            return None;
+        }
         let next = self.ready.pop_first();
         let (priority, job_id) = next?;
         self.reserve_impl(job_id.clone(), priority);
@@ -176,6 +187,9 @@ impl Channel {
     pub fn reserve_job<P>(&mut self, priority: P, job_id: JobID) -> Option<JobID>
         where P: Into<Priority> + std::fmt::Debug,
     {
+        if self.paused().is_some() {
+            return None;
+        }
         let priority = priority.into();
         let removed = self.ready.remove(&(priority, job_id));
         if removed {
@@ -429,6 +443,39 @@ impl Channel {
     #[tracing::instrument(skip(self))]
     pub fn peek_failed(&self) -> Option<(FailID, JobID)> {
         self.failed().first_key_value().map(|x| (x.0.clone(), x.1.0.clone()))
+    }
+
+    /// Pause this channel until the given timestamp. We also specify the current timestamp
+    /// which is used to determine how long the channel has been paused, if you're into that
+    /// kind of thing.
+    #[tracing::instrument(skip(self))]
+    pub fn pause(&mut self, now: Delay, unpause_at: Delay) {
+        *self.paused_mut() = Some((unpause_at, now));
+        *self.metrics_mut().cmd_pause_mut() += 1;
+    }
+
+    /// Unpause this channel.
+    #[tracing::instrument(skip(self))]
+    pub fn unpause(&mut self) {
+        *self.paused_mut() = None;
+    }
+
+    /// Update if this channel should be unpaused given the current timestamp.
+    ///
+    /// We return `true` if the channel was unpaused as a result of this call,
+    /// otherwise false.
+    #[tracing::instrument(skip(self))]
+    pub fn update_paused(&mut self, now: &Delay) -> bool {
+        if let Some((then, _)) = self.paused().as_ref() {
+            if now >= then {
+                *self.paused_mut() = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 
     /// Subscribe to this channel. This returns a crossbeam channel that notifies
@@ -922,6 +969,41 @@ mod tests {
         assert_eq!(channel2.delayed().len(), 4);
         assert_eq!(channel2.kick_jobs_delayed(2), vec![JobID::from(96), JobID::from(2)]);
         assert_eq!(channel2.delayed().len(), 3);
+    }
+
+    #[test]
+    fn pause() {
+        let mut channel = Channel::new();
+        channel.push(JobID::from(42), 1024, None::<Delay>);
+        assert_eq!(channel.reserve_next(), Some(JobID::from(42)));
+        assert_counts!(&channel, 0, 0, 1, 0, 0, 0, 1);
+        assert_eq!(channel.metrics().cmd_pause(), 0);
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        channel.pause(10.into(), 20.into());
+        assert_eq!(channel.metrics().cmd_pause(), 1);
+        assert_counts!(&channel, 0, 1, 0, 0, 0, 0, 1);
+        assert_eq!(channel.reserve_next(), None);
+        assert_eq!(channel.reserve_job(1024, JobID::from(42)), None);
+        channel.unpause();
+        assert_eq!(channel.metrics().cmd_pause(), 1);
+        assert_eq!(channel.reserve_next(), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.reserve_job(1024, JobID::from(42)), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        channel.pause(20.into(), 30.into());
+        assert_eq!(channel.metrics().cmd_pause(), 2);
+        assert_eq!(channel.reserve_next(), None);
+        assert_eq!(channel.reserve_job(1024, JobID::from(42)), None);
+        assert_eq!(channel.update_paused(&29.into()), false);
+        assert_eq!(channel.metrics().cmd_pause(), 2);
+        assert_eq!(channel.reserve_next(), None);
+        assert_eq!(channel.reserve_job(1024, JobID::from(42)), None);
+        assert_eq!(channel.update_paused(&30.into()), true);
+        assert_eq!(channel.metrics().cmd_pause(), 2);
+        assert_eq!(channel.reserve_next(), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.reserve_job(1024, JobID::from(42)), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
     }
 
     #[test]
