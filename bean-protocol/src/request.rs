@@ -66,7 +66,7 @@ pub enum Request<'a> {
     StatsTube(&'a str),
     /// Touch a job by id (reset its TTR value)
     Touch(u64),
-    /// Use a channel (to put jobs into it)
+    /// Use a channel (to put jobs into it AND to `peek` which is weird)
     Use(&'a str),
     /// Watch a channel (for job consumption)
     Watch(&'a str),
