@@ -3,12 +3,13 @@
 
 use ahash::{RandomState};
 use crate::{
-    channel::Channel,
+    channel::{Channel, ChannelMod},
     error::{Error, Result},
     job::{Delay, FailID, Job, JobID, JobMeta, JobState, JobStatus, JobStore, Priority},
     ser,
     store::{Mod, Store, to_key},
 };
+use crossbeam_channel::{Receiver};
 use dashmap::DashMap;
 use derive_builder::Builder;
 use getset::{Getters, MutGetters};
@@ -307,6 +308,7 @@ impl Queue {
             self.store().primary().remove(&job_id_ser)?;
             self.store().meta().remove(&job_id_ser)?;
         }
+        self.clean_channels()?;
         Ok(res)
     }
 
@@ -342,15 +344,102 @@ impl Queue {
     /// failed jobs, then we kick N delayed jobs and return.
     #[tracing::instrument(skip(self))]
     pub fn kick(&self, channel: &str, num: usize) -> Result<Vec<JobID>> {
-        unimplemented!();
+        match self.channels().get_mut(channel) {
+            Some(mut chan) => {
+                let kicked = if chan.metrics().failed() > 0 {
+                    chan.kick_jobs_failed(num)
+                } else {
+                    chan.kick_jobs_delayed(num)
+                };
+                Ok(kicked)
+            }
+            None => Ok(vec![]),
+        }
     }
 
-    /// Kick a specific job on the given channel, returning the kicked job id.
+    /// Kick a specific job, returning the kicked job id.
     ///
-    /// If the job is failed or delayed, we kick it, otherwise we do nussing, Lebowski.
+    /// If the job is failed or delayed, we kick it, otherwise we do nussing, Lebowski. Nussing.
     #[tracing::instrument(skip(self))]
-    pub fn kick_job(&self, channel: &str, num: usize) -> Result<Option<JobID>> {
-        unimplemented!();
+    pub fn kick_job(&self, job_id: &JobID) -> Result<Option<JobID>> {
+        let job_id_ser = to_key(job_id)?;
+        let job_ser = self.store().primary().get(&job_id_ser)?
+            .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
+        let store: JobStore = ser::deserialize(job_ser.as_ref())?;
+        let mut chan = self.channels().get_mut(store.state().channel())
+            .ok_or_else(|| Error::ChannelNotFound(store.state().channel().clone()))?;
+        let res = match store.state().status() {
+            JobStatus::Failed(ref fail_id, _) => {
+                chan.kick_job_failed(fail_id)
+            }
+            _ => {
+                chan.kick_job_delayed(job_id)
+            }
+        };
+        Ok(res)
+    }
+
+    /// Pause a channel.
+    #[tracing::instrument(skip(self))]
+    pub fn pause(&self, channel: &str, now: Delay, unpause_at: Delay) -> Result<()> {
+        let mut channel = self.channels().get_mut(channel)
+            .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+        channel.pause(now, unpause_at);
+        Ok(())
+    }
+
+    /// UNPause a channel.
+    #[tracing::instrument(skip(self))]
+    pub fn unpause(&self, channel: &str) -> Result<()> {
+        let mut channel = self.channels().get_mut(channel)
+            .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+        channel.unpause();
+        Ok(())
+    }
+
+    /// Look for and return a specific job by ID
+    #[tracing::instrument(skip(self))]
+    pub fn peek_job(&self, job_id: &JobID) -> Result<Job> {
+        let job_id_ser = to_key(job_id)?;
+        let job_ser = self.store().primary().get(&job_id_ser)?
+            .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
+        let store: JobStore = ser::deserialize(job_ser.as_ref())?;
+        let meta: Option<JobMeta> = match self.store().meta().get(&job_id_ser)? {
+            Some(ser) => ser::deserialize(ser.as_ref()).unwrap_or(None),
+            None => None,
+        };
+        let job = Job::create_from_parts(job_id.clone(), store, meta, *self.config().delay_in_meta());
+        Ok(job)
+    }
+
+    /// Look for and return a specific job by ID
+    #[tracing::instrument(skip(self))]
+    pub fn list_tubes(&self) -> Result<Vec<String>> {
+        let mut channels = Vec::with_capacity(self.channels().len());
+        for cref in self.channels().iter() {
+            channels.push(cref.key().clone());
+        }
+        Ok(channels)
+    }
+
+    /// Subscribe to a channel, returning its, well, um, channel (sigh) which allows the channel
+    /// to send events on its...channel...which subscribers can use to know to "wake up" and
+    /// reserve jobs that are then sent to their dumb `reserve` clients.
+    pub fn subscribe(&self, channel: &str) -> Result<Receiver<ChannelMod>> {
+        let mut chan = self.channels().entry(channel.to_string()).or_insert_with(|| Channel::new());
+        Ok(chan.subscribe())
+    }
+
+    /// Unsubscribe from a channel. Generally, a client calls this when its connection is
+    /// terminated.
+    pub fn unsubscribe(&self, channel: &str, signal: Receiver<ChannelMod>) -> Result<()> {
+        {
+            let mut chan = self.channels().get_mut(channel)
+                .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+            chan.unsubscribe(signal);
+        }
+        self.clean_channels()?;
+        Ok(())
     }
 
     /// Given a list of channels and an ordering value, finds the channel with the
@@ -414,6 +503,12 @@ impl Queue {
         }
         drop(lock);
         ret
+    }
+
+    /// Remove any channels that are empty and have no subscribers.
+    fn clean_channels(&self) -> Result<()> {
+        self.channels().retain(|_, chan| !chan.empty());
+        Ok(())
     }
 
     #[cfg(test)]
@@ -791,6 +886,199 @@ mod tests {
             let chan = queue2.channels().get("vidz").unwrap();
             assert_eq!(chan.failed().len(), 3);
         }
+    }
+
+    #[test]
+    fn kick_failed_delayed() {
+        let queue1 = make_queue(32);
+        let _job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("prank-calls", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job4 = queue1.enqueue("prank-calls", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job1_2 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap().unwrap();
+        let job2_2 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap().unwrap();
+        let deq1 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq1.as_ref().map(|x| x.id()), None);
+        queue1.fail_reserved(job1_2.id().clone(), None).unwrap().unwrap();
+        queue1.fail_reserved(job2_2.id().clone(), None).unwrap().unwrap();
+        // should kick the two failed, not the two delayed
+        assert_eq!(queue1.kick("prank-calls", 10).unwrap(), vec![
+            job1_2.id().clone(),
+            job2_2.id().clone(),
+        ]);
+        // should kick the two delayed now that we have no failed left LOL AHAHAH XD
+        assert_eq!(queue1.kick("prank-calls", 10).unwrap(), vec![
+            job3.clone(),
+            job4.clone(),
+        ]);
+        assert_eq!(queue1.kick("prank-calls", 10).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn kick_job() {
+        let queue1 = make_queue(32);
+        let job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("prank-calls", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job4 = queue1.enqueue("prank-calls", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job1_2 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap().unwrap();
+        let job2_2 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap().unwrap();
+        let deq1 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap();
+        assert_eq!(deq1.as_ref().map(|x| x.id()), None);
+        queue1.fail_reserved(job1_2.id().clone(), None).unwrap().unwrap();
+        queue1.fail_reserved(job2_2.id().clone(), None).unwrap().unwrap();
+        // kick buried
+        assert_eq!(queue1.kick_job(&job1).unwrap(), Some(job1.clone()));
+        assert_eq!(queue1.kick_job(&job1).unwrap(), None);
+        assert_eq!(queue1.kick_job(&job2).unwrap(), Some(job2.clone()));
+        assert_eq!(queue1.kick_job(&job2).unwrap(), None);
+        // kick delayed
+        assert_eq!(queue1.kick_job(&job3).unwrap(), Some(job3.clone()));
+        assert_eq!(queue1.kick_job(&job3).unwrap(), None);
+        assert_eq!(queue1.kick_job(&job4).unwrap(), Some(job4.clone()));
+        assert_eq!(queue1.kick_job(&job4).unwrap(), None);
+        // that should be it...LOL XD XD AHAHAHA OMG
+        assert_eq!(queue1.kick("prank-calls", 42).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn tick() {
+        let queue1 = make_queue(2);
+        let job1 = queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(6000)).unwrap();
+        queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(6000)).unwrap();
+        queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(6000)).unwrap();
+        queue1.pause("jobs", 0.into(), 2500.into()).unwrap();
+
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        queue1.tick(1000).unwrap();
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        queue1.tick(2000).unwrap();
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        queue1.tick(3000).unwrap();
+        let deq1 = queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        assert_eq!(deq1.id(), &job1);
+        let deq2 = queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
+        assert_eq!(deq2.id(), &job2);
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        queue1.tick(4000).unwrap();
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        queue1.tick(5000).unwrap();
+        // some
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_some());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_some());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_some());
+        // none
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        queue1.tick(6000).unwrap();
+        // some
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_some());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_some());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_some());
+        // none
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+        assert!(queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().is_none());
+    }
+
+    #[test]
+    fn peek_job() {
+        let queue1 = make_queue(2);
+        let job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("prank-calls", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job4 = queue1.enqueue("prank-calls", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, Some(5000)).unwrap();
+
+        assert_eq!(queue1.peek_job(&job1).unwrap().data(), &Vec::from("i'm detective john kimble".as_bytes()));
+        assert_eq!(queue1.peek_job(&job2).unwrap().data(), &Vec::from("yeah sure you are".as_bytes()));
+        assert_eq!(queue1.peek_job(&job3).unwrap().data(), &Vec::from("i'm a cop you idiot".as_bytes()));
+        assert_eq!(queue1.peek_job(&job4).unwrap().data(), &Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()));
+        let neq = JobID::from(job4.deref() + 1);
+        assert!(matches!(queue1.peek_job(&neq).unwrap_err(), Error::JobNotFound(_)));
+    }
+
+    #[test]
+    fn list_tubes() {
+        let queue1 = make_queue(16);
+        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("prank-calls2", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job3 = queue1.enqueue("prank-calls3", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job4 = queue1.enqueue("prank-calls4", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+
+        let mut chans = queue1.list_tubes().unwrap();
+        chans.sort();
+        assert_eq!(chans, vec![
+            "prank-calls1".to_string(),
+            "prank-calls2".to_string(),
+            "prank-calls3".to_string(),
+            "prank-calls4".to_string(),
+        ]);
+
+        queue1.delete(job4).unwrap().unwrap();
+        queue1.delete(job2).unwrap().unwrap();
+
+        let mut chans = queue1.list_tubes().unwrap();
+        chans.sort();
+        assert_eq!(chans, vec![
+            "prank-calls1".to_string(),
+            "prank-calls3".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn clean_channels() {
+        // channels should clean if they are empty AND have no subscribers
+        let queue1 = make_queue(16);
+        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("prank-calls2", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job3 = queue1.enqueue("prank-calls3", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job4 = queue1.enqueue("prank-calls4", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+
+        let mut chans = queue1.list_tubes().unwrap();
+        chans.sort();
+        assert_eq!(chans, vec![
+            "prank-calls1".to_string(),
+            "prank-calls2".to_string(),
+            "prank-calls3".to_string(),
+            "prank-calls4".to_string(),
+        ]);
+
+        let sub2 = queue1.subscribe("prank-calls2").unwrap();
+        let sub4 = queue1.subscribe("prank-calls4").unwrap();
+        queue1.delete(job4).unwrap().unwrap();
+        queue1.delete(job2).unwrap().unwrap();
+
+        let mut chans = queue1.list_tubes().unwrap();
+        chans.sort();
+        assert_eq!(chans, vec![
+            "prank-calls1".to_string(),
+            "prank-calls2".to_string(),
+            "prank-calls3".to_string(),
+            "prank-calls4".to_string(),
+        ]);
+
+        queue1.unsubscribe("prank-calls2", sub2).unwrap();
+        let mut chans = queue1.list_tubes().unwrap();
+        chans.sort();
+        assert_eq!(chans, vec![
+            "prank-calls1".to_string(),
+            "prank-calls3".to_string(),
+            "prank-calls4".to_string(),
+        ]);
+
+        queue1.unsubscribe("prank-calls4", sub4).unwrap();
+        let mut chans = queue1.list_tubes().unwrap();
+        chans.sort();
+        assert_eq!(chans, vec![
+            "prank-calls1".to_string(),
+            "prank-calls3".to_string(),
+        ]);
     }
 }
 

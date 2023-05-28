@@ -24,7 +24,7 @@ fn create_channel_varying_pri<D>(num: usize, priority_range: (usize, usize), del
     for i in 0..num {
         let priority = (i % diff) + priority_range.0;
         let delayval = delay.as_ref().map(|x| x[i % x.len()].clone());
-        channel.push(JobID::from(i as u64), priority as u16, delayval);
+        channel.push(JobID::from(i as u64), priority as u32, delayval);
     }
     channel
 }

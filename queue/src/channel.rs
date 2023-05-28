@@ -47,6 +47,10 @@ pub enum ChannelMod {
     Delayed,
     Deleted,
     Failed,
+    /// Used to test if the channel is disconnected because there's no good idiomatic way
+    /// to do this, unfortunately. https://github.com/crossbeam-rs/crossbeam/issues/302
+    /// lame.
+    Nop,
 }
 
 #[derive(Clone, Debug, Getters, MutGetters)]
@@ -491,6 +495,16 @@ impl Channel {
     pub fn unsubscribe(&mut self, signal: Receiver<ChannelMod>) {
         *self.metrics_mut().subscribers_mut() -= 1;
         drop(signal)
+    }
+
+    /// Returns `true` if this channel is empty and has no subscribers.
+    #[tracing::instrument(skip(self))]
+    pub fn empty(&self) -> bool {
+        self.ready().len() == 0 &&
+            self.reserved().len() == 0 &&
+            self.delayed().len() == 0 &&
+            self.failed().len() == 0 &&
+            self.metrics().subscribers() == 0
     }
 }
 
