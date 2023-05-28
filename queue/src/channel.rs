@@ -47,10 +47,6 @@ pub enum ChannelMod {
     Delayed,
     Deleted,
     Failed,
-    /// Used to test if the channel is disconnected because there's no good idiomatic way
-    /// to do this, unfortunately. https://github.com/crossbeam-rs/crossbeam/issues/302
-    /// lame.
-    Nop,
 }
 
 #[derive(Clone, Debug, Getters, MutGetters)]
