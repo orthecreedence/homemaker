@@ -400,16 +400,46 @@ impl Queue {
     /// Look for and return a specific job by ID
     #[tracing::instrument(skip(self))]
     pub fn peek_job(&self, job_id: &JobID) -> Result<Job> {
-        let job_id_ser = to_key(job_id)?;
-        let job_ser = self.store().primary().get(&job_id_ser)?
-            .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
-        let store: JobStore = ser::deserialize(job_ser.as_ref())?;
-        let meta: Option<JobMeta> = match self.store().meta().get(&job_id_ser)? {
-            Some(ser) => ser::deserialize(ser.as_ref()).unwrap_or(None),
-            None => None,
+        self.load_full_job(job_id)
+    }
+
+    /// Look for and return a the next available job on a particular channel.
+    #[tracing::instrument(skip(self))]
+    pub fn peek_ready(&self, channel: &str) -> Result<Option<Job>> {
+        let channel = self.channels().get(channel)
+            .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+        let job_id = match channel.peek_ready() {
+            Some((_, job_id)) => job_id,
+            None => return Ok(None),
         };
-        let job = Job::create_from_parts(job_id.clone(), store, meta, *self.config().delay_in_meta());
-        Ok(job)
+        self.load_full_job(&job_id)
+            .map(|x| Some(x))
+    }
+
+    /// Look for and return a specific job by ID
+    #[tracing::instrument(skip(self))]
+    pub fn peek_delayed(&self, channel: &str) -> Result<Option<Job>> {
+        let channel = self.channels().get(channel)
+            .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+        let job_id = match channel.peek_delayed() {
+            Some(job_id) => job_id,
+            None => return Ok(None),
+        };
+        self.load_full_job(&job_id)
+            .map(|x| Some(x))
+    }
+
+    /// Look for and return a specific job by ID
+    #[tracing::instrument(skip(self))]
+    pub fn peek_failed(&self, channel: &str) -> Result<Option<Job>> {
+        let channel = self.channels().get(channel)
+            .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+        let job_id = match channel.peek_failed() {
+            Some((_, job_id)) => job_id,
+            None => return Ok(None),
+        };
+        self.load_full_job(&job_id)
+            .map(|x| Some(x))
     }
 
     /// Look for and return a specific job by ID
@@ -425,6 +455,7 @@ impl Queue {
     /// Subscribe to a channel, returning its, well, um, channel (sigh) which allows the channel
     /// to send events on its...channel...which subscribers can use to know to "wake up" and
     /// reserve jobs that are then sent to their dumb `reserve` clients.
+    #[tracing::instrument(skip(self))]
     pub fn subscribe(&self, channel: &str) -> Result<Receiver<ChannelMod>> {
         let mut chan = self.channels().entry(channel.to_string()).or_insert_with(|| Channel::new());
         Ok(chan.subscribe())
@@ -432,7 +463,10 @@ impl Queue {
 
     /// Unsubscribe from a channel. Generally, a client calls this when its connection is
     /// terminated.
+    #[tracing::instrument(skip(self))]
     pub fn unsubscribe(&self, channel: &str, signal: Receiver<ChannelMod>) -> Result<()> {
+        // put this in a block so `chan` drops before we run clean_channels() (or we get
+        // deadlocks LOL XD XD AHAHAHHA)
         {
             let mut chan = self.channels().get_mut(channel)
                 .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
@@ -440,6 +474,20 @@ impl Queue {
         }
         self.clean_channels()?;
         Ok(())
+    }
+
+    /// Load a job.
+    fn load_full_job(&self, job_id: &JobID) -> Result<Job> {
+        let job_id_ser = to_key(job_id)?;
+        let job_ser = self.store().primary().get(&job_id_ser)?
+            .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
+        let store: JobStore = ser::deserialize(job_ser.as_ref())?;
+        let meta: Option<JobMeta> = match self.store().meta().get(&job_id_ser)? {
+            Some(ser) => ser::deserialize(ser.as_ref()).unwrap_or(None),
+            None => None,
+        };
+        let job = Job::create_from_parts(job_id.clone(), store, meta, *self.config().delay_in_meta());
+        Ok(job)
     }
 
     /// Given a list of channels and an ordering value, finds the channel with the
@@ -1001,6 +1049,71 @@ mod tests {
         assert_eq!(queue1.peek_job(&job4).unwrap().data(), &Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()));
         let neq = JobID::from(job4.deref() + 1);
         assert!(matches!(queue1.peek_job(&neq).unwrap_err(), Error::JobNotFound(_)));
+    }
+
+    #[test]
+    fn peek_ready() {
+        let queue1 = make_queue(4);
+        queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _sub = queue1.subscribe("get-a-job").unwrap();
+
+        let job1 = queue1.peek_ready("prank-calls1").unwrap().unwrap();
+        assert_eq!(job1.data(), &Vec::from("yeah sure you are".as_bytes()));
+        let job2 = queue1.peek_ready("prank-calls2").unwrap().unwrap();
+        assert_eq!(job2.data(), &Vec::from("i'm a cop you idiot".as_bytes()));
+        assert!(queue1.peek_ready("get-a-job").unwrap().is_none());
+        assert!(matches!(queue1.peek_ready("poopy-butt").unwrap_err(), Error::ChannelNotFound(_)));
+        assert!(queue1.peek_delayed("prank-calls2").unwrap().is_none());
+        assert!(queue1.peek_failed("prank-calls1").unwrap().is_none());
+        assert!(queue1.peek_failed("prank-calls2").unwrap().is_none());
+    }
+
+    #[test]
+    fn peek_delayed() {
+        let queue1 = make_queue(4);
+        queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _sub = queue1.subscribe("get-a-job").unwrap();
+
+        let job1 = queue1.peek_delayed("prank-calls1").unwrap().unwrap();
+        assert_eq!(job1.data(), &Vec::from("i'm detective john kimble".as_bytes()));
+        assert!(queue1.peek_delayed("prank-calls2").unwrap().is_none());
+        assert!(queue1.peek_delayed("get-a-job").unwrap().is_none());
+        assert!(matches!(queue1.peek_delayed("poopy-butt").unwrap_err(), Error::ChannelNotFound(_)));
+        assert!(queue1.peek_failed("prank-calls1").unwrap().is_none());
+        assert!(queue1.peek_failed("prank-calls2").unwrap().is_none());
+    }
+
+    #[test]
+    fn peek_failed() {
+        let queue1 = make_queue(4);
+        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, Some(5000)).unwrap();
+        let job2 = queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job3 = queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job4 = queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _sub = queue1.subscribe("get-a-job").unwrap();
+
+        assert!(queue1.peek_failed("prank-calls1").unwrap().is_none());
+        assert!(queue1.peek_failed("prank-calls2").unwrap().is_none());
+        assert!(queue1.peek_failed("get-a-job").unwrap().is_none());
+        assert!(matches!(queue1.peek_failed("poopy-butt").unwrap_err(), Error::ChannelNotFound(_)));
+
+        let job2_d = queue1.dequeue(&vec!["prank-calls1".into(), "prank-calls2".into()], Ordering::Strict).unwrap().unwrap();
+        assert_eq!(job2_d.id(), &job2);
+        queue1.fail_reserved(job2_d.id().clone(), Some(Vec::from("i will. bye.".as_bytes()))).unwrap();
+        let peeked1 = queue1.peek_failed("prank-calls1").unwrap().unwrap();
+        assert_eq!(peeked1.id(), &job2);
+        match peeked1.state().status() {
+            JobStatus::Failed(_, faildata) => {
+                assert_eq!(faildata, &Some(Vec::from("i will. bye.".as_bytes())));
+            }
+            _ => panic!("this was unexpected"),
+        }
     }
 
     #[test]
