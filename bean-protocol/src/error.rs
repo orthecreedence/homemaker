@@ -19,6 +19,10 @@ pub enum Error<'a> {
     #[error("IO error")]
     Io(#[from] std::io::Error),
 
+    /// Tried to add a big job
+    #[error("Job too big: {0}")]
+    JobTooBig(u64),
+
     /// There was an error parsing the protocol
     #[error("Error parsing the protocol")]
     Parse(NomError<&'a [u8]>),
