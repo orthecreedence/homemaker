@@ -8,8 +8,8 @@ use crate::{
 pub use nom;
 
 use nom::{
-    Finish, IResult,
-    bytes::complete::{take, take_while1},
+    IResult,
+    bytes::streaming::{take, take_while1},
     character::{is_alphanumeric, complete::{self as nomchar, char, crlf}},
     error::{Error as NomError, ErrorKind as NomErrorKind},
     sequence::{tuple, terminated},
@@ -72,6 +72,15 @@ pub enum Request<'a> {
     Watch(&'a str),
 }
 
+macro_rules! finish {
+    ($op:expr) => {
+        match $op {
+            IResult::Ok(res) => Ok(res),
+            IResult::Err(nom::Err::Error(e)) | IResult::Err(nom::Err::Failure(e)) => Err(Error::Parse(e)),
+            IResult::Err(nom::Err::Incomplete(needed)) => Err(Error::ParseIncomplete(needed)),
+        }
+    }
+}
 
 fn is_alphanum_dash(chr: u8) -> bool {
     is_alphanumeric(chr) || chr == b'-'
@@ -125,8 +134,8 @@ fn parse_bury<'a>(inp: &'a [u8]) -> IResult<&'a [u8], (u64, u32)> {
 
 fn parse_pause_tube<'a>(inp: &'a [u8]) -> Result<(&'a [u8], (&'a str, u32))> {
     let (rest, channel) = parse_channel(inp)?;
-    let (rest, _) = parse_space(rest).finish()?;
-    let (rest, secs) = parse_u32_eol(rest).finish()?;
+    let (rest, _) = finish!(parse_space(rest))?;
+    let (rest, secs) = finish!(parse_u32_eol(rest))?;
     Ok((rest, (channel, secs)))
 }
 
@@ -153,7 +162,7 @@ fn parse_channel_impl<'a>(inp: &'a [u8]) -> IResult<&'a [u8], &'a [u8]> {
 }
 
 fn parse_channel<'a>(inp: &'a [u8]) -> Result<(&'a [u8], &'a str)> {
-    let (rest, channel_ser) = parse_channel_impl(inp).finish()?;
+    let (rest, channel_ser) = finish!(parse_channel_impl(inp))?;
     // channels cannot start with dash
     if channel_ser[0] == b'-' {
         Err(Error::Parse(NomError { input: inp, code: NomErrorKind::Char }))?;
@@ -166,7 +175,7 @@ fn parse_channel<'a>(inp: &'a [u8]) -> Result<(&'a [u8], &'a str)> {
 
 fn parse_channel_eol<'a>(inp: &'a [u8]) -> Result<(&'a [u8], &'a str)> {
     let (rest, channel) = parse_channel(inp)?;
-    let (rest, _) = parse_crlf(rest).finish()?;
+    let (rest, _) = finish!(parse_crlf(rest))?;
     Ok((rest, channel))
 }
 
@@ -184,118 +193,118 @@ fn parse_u64_eol<'a>(inp: &'a [u8]) -> IResult<&'a [u8], u64> {
 /// This is a zero-copy operation (except the integers, probably) that returns the remainder of
 /// the byte slice after parsing is done, allowing for continued parsing.
 pub fn parse_request<'a>(inp: &'a [u8]) -> Result<(&'a [u8], Request)> {
-    let (rest, req) = parse_cmd(inp).finish()?;
+    let (rest, req) = finish!(parse_cmd(inp))?;
     let (rest, request) = match req {
         b"bury" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, (job_id, priority)) = parse_bury(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, (job_id, priority)) = finish!(parse_bury(rest))?;
             (rest, Request::Bury(job_id, priority))
         }
         b"delete" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, job_id) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, job_id) = finish!(parse_u64_eol(rest))?;
             (rest, Request::Delete(job_id))
         }
         b"ignore" => {
-            let (rest, _) = parse_space(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
             let (rest, channel) = parse_channel_eol(rest)?;
             (rest, Request::Ignore(channel))
         }
         b"kick" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, num) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, num) = finish!(parse_u64_eol(rest))?;
             (rest, Request::Kick(num))
         }
         b"kick-job" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, job_id) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, job_id) = finish!(parse_u64_eol(rest))?;
             (rest, Request::KickJob(job_id))
         }
         b"list-tubes" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::ListTubes)
         }
         b"list-tube-used" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::ListTubeUsed)
         }
         b"pause-tube" => {
-            let (rest, _) = parse_space(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
             let (rest, (channel, secs)) = parse_pause_tube(rest)?;
             (rest, Request::PauseTube(channel, secs))
         }
         b"peek" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, job_id) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, job_id) = finish!(parse_u64_eol(rest))?;
             (rest, Request::Peek(job_id))
         }
         b"peek-buried" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::PeekBuried)
         }
         b"peek-delayed" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::PeekDelayed)
         }
         b"peek-ready" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::PeekReady)
         }
         b"put" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, (priority, delay, ttr, num_bytes)) = parse_put(rest).finish()?;
-            let (rest, data) = parse_data(rest, num_bytes as usize).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, (priority, delay, ttr, num_bytes)) = finish!(parse_put(rest))?;
+            let (rest, data) = finish!(parse_data(rest, num_bytes as usize))?;
             (rest, Request::Put(priority, delay, ttr, data))
         }
         b"quit" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::Quit)
         }
         b"release" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, (job_id, priority, delay)) = parse_release(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, (job_id, priority, delay)) = finish!(parse_release(rest))?;
             (rest, Request::Release(job_id, priority, delay))
         }
         b"reserve" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::Reserve)
         }
         b"reserve-job" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, job_id) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, job_id) = finish!(parse_u64_eol(rest))?;
             (rest, Request::ReserveJob(job_id))
         }
         b"reserve-with-timeout" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, timeout) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, timeout) = finish!(parse_u64_eol(rest))?;
             (rest, Request::ReserveWithTimeout(timeout))
         }
         b"stats" => {
-            let (rest, _) = parse_crlf(rest).finish()?;
+            let (rest, _) = finish!(parse_crlf(rest))?;
             (rest, Request::Stats)
         }
         b"stats-job" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, job_id) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, job_id) = finish!(parse_u64_eol(rest))?;
             (rest, Request::StatsJob(job_id))
         }
         b"stats-tube" => {
-            let (rest, _) = parse_space(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
             let (rest, channel) = parse_channel_eol(rest)?;
             (rest, Request::StatsTube(channel))
         }
         b"touch" => {
-            let (rest, _) = parse_space(rest).finish()?;
-            let (rest, job_id) = parse_u64_eol(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
+            let (rest, job_id) = finish!(parse_u64_eol(rest))?;
             (rest, Request::Touch(job_id))
         }
         b"use" => {
-            let (rest, _) = parse_space(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
             let (rest, channel) = parse_channel_eol(rest)?;
             (rest, Request::Use(channel))
         }
         b"watch" => {
-            let (rest, _) = parse_space(rest).finish()?;
+            let (rest, _) = finish!(parse_space(rest))?;
             let (rest, channel) = parse_channel_eol(rest)?;
             (rest, Request::Watch(channel))
         }
@@ -314,17 +323,26 @@ mod tests {
         "too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long-too-long"
     }
 
-    macro_rules! assert_err {
-        ($inp:expr, $i:expr, $kind:expr) => {
-            {
-                let bytes = $inp;
-                let res = parse_request(bytes).unwrap_err();
-                match res {
-                    Error::Parse(nom) => assert_eq!((nom.input, nom.code), (&bytes[$i..], $kind)),
-                    _ => panic!("Expected Error::Parse(..) but got {:?}", res),
-                }
+    macro_rules! assert_incomplete {
+        ($inp:expr) => {{
+            let bytes = $inp;
+            let res = parse_request(bytes).unwrap_err();
+            match res {
+                Error::ParseIncomplete(_needed) => {}
+                _ => panic!("Expected Error::ParseIncomplete(..) but got {:?}", res),
             }
-        }
+        }}
+    }
+
+    macro_rules! assert_err {
+        ($inp:expr, $i:expr, $kind:expr) => {{
+            let bytes = $inp;
+            let res = parse_request(bytes).unwrap_err();
+            match res {
+                Error::Parse(nom) => assert_eq!((nom.input, nom.code), (&bytes[$i..], $kind)),
+                _ => panic!("Expected Error::Parse(..) but got {:?}", res),
+            }
+        }}
     }
 
     macro_rules! test_cmd_bare {
@@ -513,7 +531,7 @@ mod tests {
         }
 
         assert_eq!(parse_request(b"putt 1024 0 300 9\nget a job\r\n").unwrap_err(), Error::UnknownRequest("putt"));
-        assert_err!(b"put", 3, ErrorKind::Char);
+        assert_incomplete!(b"put");
         assert_err!(b"put ", 4, ErrorKind::Digit);
         assert_err!(b"put 1", 5, ErrorKind::Char);
         assert_err!(b"put 1 ", 6, ErrorKind::Digit);
@@ -522,8 +540,8 @@ mod tests {
         assert_err!(b"put 1 1 1", 9, ErrorKind::Char);
         assert_err!(b"put 1 1 1 ", 10, ErrorKind::Digit);
         assert_err!(b"put 1 1 1 5", 11, ErrorKind::CrLf);
-        assert_err!(b"put 1 1 1 5\r\n", 13, ErrorKind::Eof);
-        assert_err!(b"put 1 1 1 5\r\nasdf", 13, ErrorKind::Eof);
+        assert_incomplete!(b"put 1 1 1 5\r\n");
+        assert_incomplete!(b"put 1 1 1 5\r\nasdf");
         assert_err!(b"put 1 1 1 5\r\nasdfc", 18, ErrorKind::CrLf);
         assert_err!(b"put 4294967296 123 123 9\r\nget a job\r\n", 4, ErrorKind::Digit);
         assert_err!(b"put 123 4294967296 123 9\r\nget a job\r\n", 8, ErrorKind::Digit);
@@ -534,7 +552,7 @@ mod tests {
         assert_err!(b"put 123 123 a123 9\r\nget a job\r\n", 12, ErrorKind::Digit);
         assert_err!(b"put 123 123 123 z9\r\nget a job\r\n", 16, ErrorKind::Digit);
         assert_err!(b"put 123 123 123 9\r\npoo get a job\r\n", 28, ErrorKind::CrLf);
-        assert_err!(b"put 123 123 123 9\r\na job\r\n", 19, ErrorKind::Eof);
+        assert_incomplete!(b"put 123 123 123 9\r\na job\r\n");
     }
 
     #[test]
@@ -556,7 +574,7 @@ mod tests {
         }
 
         assert_eq!(parse_request(b"rewease 222 3333 4444\r\n").unwrap_err(), Error::UnknownRequest("rewease"));
-        assert_err!(b"release", 7, ErrorKind::Char);
+        assert_incomplete!(b"release");
         assert_err!(b"release ", 8, ErrorKind::Digit);
         assert_err!(b"release zex", 8, ErrorKind::Digit);
         assert_err!(b"release 18446744073709551616 123 123\r\n", 8, ErrorKind::Digit);
@@ -636,6 +654,12 @@ mod tests {
         let (rest, cmd7) = parse_request(rest).unwrap();
         assert_eq!(cmd7, Request::Quit);
         assert_eq!(rest, b"");
+    }
+
+    #[test]
+    fn eof() {
+        let res = parse_request(b"use bar");
+        assert!(matches!(res.unwrap_err(), Error::ParseIncomplete(_)));
     }
 }
 

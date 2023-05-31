@@ -15,12 +15,17 @@ pub enum Error<'a> {
     #[error("Error converting bytes to utf8 string")]
     Conversion(#[from] std::str::Utf8Error),
 
+    /// AN IO ERROR
     #[error("IO error")]
     Io(#[from] std::io::Error),
 
     /// There was an error parsing the protocol
     #[error("Error parsing the protocol")]
     Parse(NomError<&'a [u8]>),
+
+    /// The parser received incomplete data
+    #[error("Incomplete data")]
+    ParseIncomplete(nom::Needed),
 
     /// An unknown command was encountered
     #[error("Unknown command: {0}")]
