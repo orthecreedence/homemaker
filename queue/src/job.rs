@@ -95,6 +95,8 @@ pub struct JobState {
     /// How many seconds this job can be reserved before it is released
     /// automatically
     ttr: u32,
+    /// When the job was created.
+    created: Timestamp,
     /// An optional delay. This is stored as a timestamp (ms) after which the job will be
     /// ready for processing again.
     delay: Option<Timestamp>,
@@ -102,15 +104,16 @@ pub struct JobState {
 
 impl JobState {
     /// Create a new `JobState`
-    pub fn new<P, D>(channel: String, priority: P, status: JobStatus, ttr: u32, delay: Option<D>) -> Self
+    pub fn new<P, T>(channel: String, priority: P, status: JobStatus, ttr: u32, created: T, delay: Option<T>) -> Self
         where P: Into<Priority>,
-              D: Into<Timestamp>,
+              T: Into<Timestamp>,
     {
         Self {
             channel,
             priority: priority.into(),
             status,
             ttr,
+            created: created.into(),
             delay: delay.map(|x| x.into()),
         }
     }
