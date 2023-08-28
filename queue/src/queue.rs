@@ -5,7 +5,7 @@ use ahash::{RandomState};
 use crate::{
     channel::{Channel, ChannelMod},
     error::{Error, Result},
-    job::{Delay, FailID, Job, JobID, JobMeta, JobState, JobStatus, JobStore, Priority},
+    job::{FailID, Job, JobID, JobMeta, JobState, JobStatus, JobStore, Priority, Timestamp},
     ser,
     store::{Mod, Store, to_key},
 };
@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use derive_builder::Builder;
 use getset::{Getters, MutGetters};
 use std::sync::{Mutex};
-use tracing::{warn};
+use tracing::{debug, warn};
 
 /// Defines guarantees for [dequeuing][Queue::dequeue] jobs *from multiple channels*.
 /// This does not matter if only grabbing jobs from one channel.
@@ -30,6 +30,7 @@ pub enum Ordering {
     /// guarantees strict priority/id ordering, but blocks other threads from
     /// grabbing jobs.
     Strict,
+    #[cfg(test)]
     /// Exactly like `Strict` ordering, but lets you run a function while the channel
     /// lock is being held open (just before unlocking). Probably only good for testing.
     /// But wow, is it great for testing.
@@ -41,6 +42,7 @@ impl std::fmt::Debug for Ordering {
         match self {
             Self::Loose => write!(f, "Loose"),
             Self::Strict => write!(f, "Strict"),
+            #[cfg(test)]
             Self::StrictOp(_) => write!(f, "StrictOp(FnMut)"),
         }
     }
@@ -82,6 +84,7 @@ impl Queue {
     /// the jobs and channels within that storage layer in-memory.
     pub fn new(config: QueueConfig, store: Store, estimated_num_channels: usize) -> Result<Self> {
         let channels = DashMap::with_capacity_and_hasher_and_shard_amount(estimated_num_channels, RandomState::new(), estimated_num_channels);
+        debug!("Queue::new() -- {:?}", config);
         Ok(Self {
             config,
             channels,
@@ -119,7 +122,7 @@ impl Queue {
     /// Loop over our channels and perform any needed maintenance (pausing, expiring delayed
     /// jobs, etc).
     pub fn tick<D>(&self, now: D) -> Result<()>
-        where D: Into<Delay> + Copy + std::fmt::Debug,
+        where D: Into<Timestamp> + Copy + std::fmt::Debug,
     {
         let now = now.into();
         let mut expired = Vec::new();
@@ -151,10 +154,10 @@ impl Queue {
     /// can be specified, which is a unix timestamp in milliseconds (ie, the time the job becomes
     /// ready).
     #[tracing::instrument(skip(self))]
-    pub fn enqueue<C, P, D>(&self, channel_name: C, job_data: Vec<u8>, priority: P, ttr: u64, delay: Option<D>) -> Result<JobID>
+    pub fn enqueue<C, P, D>(&self, channel_name: C, job_data: Vec<u8>, priority: P, ttr: u32, delay: Option<D>) -> Result<JobID>
         where C: Into<String> + std::fmt::Debug,
               P: Into<Priority> + Copy + std::fmt::Debug,
-              D: Into<Delay> + Copy + std::fmt::Debug,
+              D: Into<Timestamp> + Copy + std::fmt::Debug,
     {
         let job_id_val = self.store().primary().generate_id()?;
         let job_id = JobID::from(job_id_val);
@@ -242,7 +245,7 @@ impl Queue {
     #[tracing::instrument(skip(self))]
     pub fn release<P, D>(&self, job_id: &JobID, priority: P, delay: Option<D>) -> Result<JobID>
         where P: Into<Priority> + std::fmt::Debug,
-              D: Into<Delay> + std::fmt::Debug,
+              D: Into<Timestamp> + std::fmt::Debug,
     {
         let store = self.store().primary().get(ser::serialize(job_id)?)?
             .map(|x| ser::deserialize::<JobStore>(x.as_ref()))
@@ -272,7 +275,7 @@ impl Queue {
         let job_ser = self.store().primary().get(&job_id_ser)?
             .ok_or_else(|| Error::JobNotFound(job_id))?;
         let mut job: JobStore = ser::deserialize(&job_ser)?;
-        let delay: Option<Delay> = if *self.config().delay_in_meta() {
+        let delay: Option<Timestamp> = if *self.config().delay_in_meta() {
             self.store().meta().get(&job_id_ser)?
                 .map(|meta_ser| {
                     ser::deserialize(&meta_ser)
@@ -381,7 +384,7 @@ impl Queue {
 
     /// Pause a channel.
     #[tracing::instrument(skip(self))]
-    pub fn pause(&self, channel: &str, now: Delay, unpause_at: Delay) -> Result<()> {
+    pub fn pause(&self, channel: &str, now: Timestamp, unpause_at: Timestamp) -> Result<()> {
         let mut channel = self.channels().get_mut(channel)
             .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
         channel.pause(now, unpause_at);
@@ -416,7 +419,7 @@ impl Queue {
             .map(|x| Some(x))
     }
 
-    /// Look for and return a specific job by ID
+    /// Look for and return a specific delayed job by ID
     #[tracing::instrument(skip(self))]
     pub fn peek_delayed(&self, channel: &str) -> Result<Option<Job>> {
         let channel = self.channels().get(channel)
@@ -429,7 +432,7 @@ impl Queue {
             .map(|x| Some(x))
     }
 
-    /// Look for and return a specific job by ID
+    /// Look for and return a specific failed job by ID
     #[tracing::instrument(skip(self))]
     pub fn peek_failed(&self, channel: &str) -> Result<Option<Job>> {
         let channel = self.channels().get(channel)
@@ -442,9 +445,9 @@ impl Queue {
             .map(|x| Some(x))
     }
 
-    /// Look for and return a specific job by ID
+    /// list channels
     #[tracing::instrument(skip(self))]
-    pub fn list_tubes(&self) -> Result<Vec<String>> {
+    pub fn list_channels(&self) -> Result<Vec<String>> {
         let mut channels = Vec::with_capacity(self.channels().len());
         for cref in self.channels().iter() {
             channels.push(cref.key().clone());
@@ -506,8 +509,14 @@ impl Queue {
             };
         }
 
-        let lock = match ordering {
-            Ordering::Strict | Ordering::StrictOp(_) => {
+        let ordering2 = match &ordering {
+            Ordering::Strict => Ordering::Strict,
+            Ordering::Loose => Ordering::Loose,
+            #[cfg(test)]
+            Ordering::StrictOp(_) => Ordering::Strict,
+        };
+        let lock = match ordering2 {
+            Ordering::Strict => {
                 let handle = match self.dequeue_lock().lock() {
                     Ok(x) => x,
                     Err(e) => Err(Error::ChannelLockError(format!("{:?}", e)))?,
@@ -546,6 +555,7 @@ impl Queue {
         } else {
             Ok(None)
         };
+        #[cfg(test)]
         if let Ordering::StrictOp(mut op) = ordering {
             op();
         }
@@ -597,17 +607,17 @@ mod tests {
         let queue1 = make_queue(32);
         assert_eq!(queue1.channels.len(), 0);
         assert_eq!(queue1.channels.contains_key("blixtopher"), false);
-        queue1.enqueue("blixtopher", Vec::from("get a job".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("blixtopher", Vec::from("get a job".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         assert_eq!(queue1.channels.len(), 1);
         assert_eq!(queue1.channels.contains_key("blixtopher"), true);
         assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().ready(), 1);
         assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().delayed(), 0);
-        queue1.enqueue("blixtopher", Vec::from("say hello".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("blixtopher", Vec::from("say hello".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         assert_eq!(queue1.channels.len(), 1);
         assert_eq!(queue1.channels.contains_key("blixtopher"), true);
         assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().ready(), 2);
         assert_eq!(queue1.channels.get("blixtopher").unwrap().metrics().delayed(), 0);
-        queue1.enqueue("WORK", Vec::from("get a job".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("WORK", Vec::from("get a job".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         assert_eq!(queue1.channels.len(), 2);
         assert_eq!(queue1.channels.contains_key("WORK"), true);
         assert_eq!(queue1.channels.get("WORK").unwrap().metrics().ready(), 1);
@@ -626,10 +636,10 @@ mod tests {
     #[test]
     fn dequeue() {
         let queue1  = make_queue(32);
-        queue1.enqueue("videos", Vec::from("process-vid1".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        queue1.enqueue("videos", Vec::from("process-vid2".as_bytes()), 1000, 300, None::<Delay>).unwrap();
-        queue1.enqueue("videos", Vec::from("process-vid3".as_bytes()), 1000, 300, None::<Delay>).unwrap();
-        queue1.enqueue("downloads", Vec::from("https://post.vidz.ru/videos/YOUR-WIFE-WITH-THE-NEIGHBOR.rar.mp4.avi.exe".as_bytes()), 1001, 300, None::<Delay>).unwrap();
+        queue1.enqueue("videos", Vec::from("process-vid1".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("videos", Vec::from("process-vid2".as_bytes()), 1000, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("videos", Vec::from("process-vid3".as_bytes()), 1000, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("downloads", Vec::from("https://post.vidz.ru/videos/YOUR-WIFE-WITH-THE-NEIGHBOR.rar.mp4.avi.exe".as_bytes()), 1001, 300, None::<Timestamp>).unwrap();
 
         let job1 = queue1.dequeue(&vec!["videos".into()], Ordering::Strict).unwrap().unwrap();
         assert_eq!(job1.data(), &Vec::from("process-vid2".as_bytes()));
@@ -661,15 +671,15 @@ mod tests {
     #[test]
     fn restore() {
         let queue1 = make_queue(32);
-        let job1 = queue1.enqueue("jobs", Vec::from("do stuff".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue1.enqueue("jobs", Vec::from("do something".as_bytes()), 0, 300, None::<Delay>).unwrap();
-        let job3 = queue1.enqueue("jobs", Vec::from("do something else".as_bytes()), 0, 300, None::<Delay>).unwrap();
+        let job1 = queue1.enqueue("jobs", Vec::from("do stuff".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue1.enqueue("jobs", Vec::from("do something".as_bytes()), 0, 300, None::<Timestamp>).unwrap();
+        let job3 = queue1.enqueue("jobs", Vec::from("do something else".as_bytes()), 0, 300, None::<Timestamp>).unwrap();
         let job4 = queue1.enqueue("jobs", Vec::from("do later".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        let job5 = queue1.enqueue("todo", Vec::from("make todo list".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job5 = queue1.enqueue("todo", Vec::from("make todo list".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         // "i have done that," said toad
         let job6 = queue1.enqueue("todo", Vec::from("wake up".as_bytes()), 1024, 300, Some(4000)).unwrap();
         for i in 0..9000 {
-            queue1.enqueue("chain", Vec::from(format!("send this queue to {} people or else", i).as_bytes()), 2000, 300, None::<Delay>).unwrap();
+            queue1.enqueue("chain", Vec::from(format!("send this queue to {} people or else", i).as_bytes()), 2000, 300, None::<Timestamp>).unwrap();
         }
         let deq1 = queue1.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap().unwrap();
         assert_eq!(deq1.id(), &job2);
@@ -710,16 +720,16 @@ mod tests {
     #[test]
     fn dequeue_job() {
         let queue = make_queue(32);
-        let job1 = queue.enqueue("jobs", Vec::from("jerry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue.enqueue("jobs", Vec::from("larry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job3 = queue.enqueue("jobs", Vec::from("barry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job4 = queue.enqueue("jobs", Vec::from("mary".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job5 = queue.enqueue("jobs", Vec::from("harry".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job6 = queue.enqueue("jobs", Vec::from("dary".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job1 = queue.enqueue("jobs", Vec::from("jerry".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue.enqueue("jobs", Vec::from("larry".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job3 = queue.enqueue("jobs", Vec::from("barry".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job4 = queue.enqueue("jobs", Vec::from("mary".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job5 = queue.enqueue("jobs", Vec::from("harry".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job6 = queue.enqueue("jobs", Vec::from("dary".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
 
         let deq1 = queue.dequeue(&vec!["jobs".into()], Ordering::Strict).unwrap();
         assert_eq!(deq1.as_ref().map(|x| x.id()), Some(&job1));
-        assert_eq!(queue.release(&job1, 1024, None::<Delay>).unwrap(), job1);
+        assert_eq!(queue.release(&job1, 1024, None::<Timestamp>).unwrap(), job1);
 
         let deq_id = queue.dequeue_job(job4.clone()).unwrap();
         assert_eq!(deq_id.as_ref().map(|x| x.id()), Some(&job4));
@@ -743,9 +753,9 @@ mod tests {
     fn dequeue_parallel_strict() {
         let num_threads = 128;
         let queue1 = make_queue(32);
-        let job1_id = queue1.enqueue("vids1", Vec::from("threw rocks at my car".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2_id = queue1.enqueue("vids2", Vec::from("we don't have any kids".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job3_id = queue1.enqueue("vids3", Vec::from("went to the house of the kids".as_bytes()), 1000, 300, None::<Delay>).unwrap();
+        let job1_id = queue1.enqueue("vids1", Vec::from("threw rocks at my car".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2_id = queue1.enqueue("vids2", Vec::from("we don't have any kids".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job3_id = queue1.enqueue("vids3", Vec::from("went to the house of the kids".as_bytes()), 1000, 300, None::<Timestamp>).unwrap();
 
         let deq1 = queue1.dequeue(&vec!["vids1".into(), "vids2".into(), "vids3".into()], Ordering::Strict).unwrap().unwrap();
         let deq2 = queue1.dequeue(&vec!["vids2".into(), "vids3".into(), "vids1".into()], Ordering::Strict).unwrap().unwrap();
@@ -759,7 +769,7 @@ mod tests {
         for pri in [1024, 1000, 100, 2000].iter() {
             for i in 0..5 {
                 for chan in ["vids1", "vids2", "vids3"].iter() {
-                    queue2.enqueue(*chan, Vec::from(format!("{}/{}", pri, i).as_bytes()), *pri, 300, None::<Delay>).unwrap();
+                    queue2.enqueue(*chan, Vec::from(format!("{}/{}", pri, i).as_bytes()), *pri, 300, None::<Timestamp>).unwrap();
                 }
             }
         }
@@ -847,15 +857,15 @@ mod tests {
     #[test]
     fn release() {
         let queue1 = make_queue(32);
-        queue1.enqueue("videos", Vec::from("process-vid1".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        queue1.enqueue("videos", Vec::from("process-vid2".as_bytes()), 1000, 300, None::<Delay>).unwrap();
-        queue1.enqueue("videos", Vec::from("process-vid3".as_bytes()), 1000, 300, None::<Delay>).unwrap();
-        queue1.enqueue("downloads", Vec::from("https://big-files.com/document".as_bytes()), 1001, 300, None::<Delay>).unwrap();
-        queue1.enqueue("downloads", Vec::from("https://big-files.com/BIG-document".as_bytes()), 1001, 300, None::<Delay>).unwrap();
+        queue1.enqueue("videos", Vec::from("process-vid1".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("videos", Vec::from("process-vid2".as_bytes()), 1000, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("videos", Vec::from("process-vid3".as_bytes()), 1000, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("downloads", Vec::from("https://big-files.com/document".as_bytes()), 1001, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("downloads", Vec::from("https://big-files.com/BIG-document".as_bytes()), 1001, 300, None::<Timestamp>).unwrap();
 
         let job1 = queue1.dequeue(&vec!["videos".into(), "downloads".into(), "flabbywabby".into()], Ordering::Strict).unwrap().unwrap();
         assert_eq!(job1.data(), &Vec::from("process-vid2".as_bytes()));
-        let job1_id = queue1.release(job1.id(), 1001, None::<Delay>).unwrap();
+        let job1_id = queue1.release(job1.id(), 1001, None::<Timestamp>).unwrap();
         assert_eq!(&job1_id, job1.id());
 
         let job2 = queue1.dequeue(&vec!["videos".into(), "downloads".into(), "flabbywabby".into()], Ordering::Strict).unwrap().unwrap();
@@ -872,11 +882,11 @@ mod tests {
     #[test]
     fn delete() {
         let queue1 = make_queue(32);
-        let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let job2 = queue1.enqueue("vidz", Vec::from("edit".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        let job3 = queue1.enqueue("vidz", Vec::from("show".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("vidz", Vec::from("show".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
 
         queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
         let deq2 = queue1.dequeue(&vec!["vidz".into()], Ordering::Strict).unwrap().unwrap();
@@ -897,11 +907,11 @@ mod tests {
     #[test]
     fn fail_reserved() {
         let queue1 = make_queue(32);
-        let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job1 = queue1.enqueue("vidz", Vec::from("record".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let job2 = queue1.enqueue("vidz", Vec::from("edit".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        let job3 = queue1.enqueue("vidz", Vec::from("watch".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job3 = queue1.enqueue("vidz", Vec::from("watch".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job4 = queue1.enqueue("vidz", Vec::from("critique".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job5 = queue1.enqueue("vidz", Vec::from("sob-uncontrollably".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
 
         assert_eq!(queue1.fail_reserved(job1, None).unwrap(), None);
         assert_eq!(queue1.fail_reserved(job2, None).unwrap(), None);
@@ -939,8 +949,8 @@ mod tests {
     #[test]
     fn kick_failed_delayed() {
         let queue1 = make_queue(32);
-        let _job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let _job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let _job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let job3 = queue1.enqueue("prank-calls", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, Some(5000)).unwrap();
         let job4 = queue1.enqueue("prank-calls", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, Some(5000)).unwrap();
         let job1_2 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap().unwrap();
@@ -965,8 +975,8 @@ mod tests {
     #[test]
     fn kick_job() {
         let queue1 = make_queue(32);
-        let job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let job3 = queue1.enqueue("prank-calls", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, Some(5000)).unwrap();
         let job4 = queue1.enqueue("prank-calls", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, Some(5000)).unwrap();
         let job1_2 = queue1.dequeue(&vec!["prank-calls".into()], Ordering::Strict).unwrap().unwrap();
@@ -992,8 +1002,8 @@ mod tests {
     #[test]
     fn tick() {
         let queue1 = make_queue(2);
-        let job1 = queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job1 = queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(5000)).unwrap();
         queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(5000)).unwrap();
         queue1.enqueue("jobs", Vec::from("hello".as_bytes()), 1024, 300, Some(5000)).unwrap();
@@ -1038,8 +1048,8 @@ mod tests {
     #[test]
     fn peek_job() {
         let queue1 = make_queue(2);
-        let job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job1 = queue1.enqueue("prank-calls", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue1.enqueue("prank-calls", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let job3 = queue1.enqueue("prank-calls", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, Some(5000)).unwrap();
         let job4 = queue1.enqueue("prank-calls", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, Some(5000)).unwrap();
 
@@ -1055,9 +1065,9 @@ mod tests {
     fn peek_ready() {
         let queue1 = make_queue(4);
         queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let _sub = queue1.subscribe("get-a-job").unwrap();
 
         let job1 = queue1.peek_ready("prank-calls1").unwrap().unwrap();
@@ -1075,9 +1085,9 @@ mod tests {
     fn peek_delayed() {
         let queue1 = make_queue(4);
         queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let _sub = queue1.subscribe("get-a-job").unwrap();
 
         let job1 = queue1.peek_delayed("prank-calls1").unwrap().unwrap();
@@ -1093,9 +1103,9 @@ mod tests {
     fn peek_failed() {
         let queue1 = make_queue(4);
         let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, Some(5000)).unwrap();
-        let job2 = queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let _job3 = queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let _job4 = queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let job2 = queue1.enqueue("prank-calls1", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let _job3 = queue1.enqueue("prank-calls2", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let _job4 = queue1.enqueue("prank-calls2", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
         let _sub = queue1.subscribe("get-a-job").unwrap();
 
         assert!(queue1.peek_failed("prank-calls1").unwrap().is_none());
@@ -1117,14 +1127,14 @@ mod tests {
     }
 
     #[test]
-    fn list_tubes() {
+    fn list_channels() {
         let queue1 = make_queue(16);
-        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue1.enqueue("prank-calls2", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let _job3 = queue1.enqueue("prank-calls3", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job4 = queue1.enqueue("prank-calls4", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue1.enqueue("prank-calls2", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let _job3 = queue1.enqueue("prank-calls3", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job4 = queue1.enqueue("prank-calls4", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
 
-        let mut chans = queue1.list_tubes().unwrap();
+        let mut chans = queue1.list_channels().unwrap();
         chans.sort();
         assert_eq!(chans, vec![
             "prank-calls1".to_string(),
@@ -1136,7 +1146,7 @@ mod tests {
         queue1.delete(job4).unwrap().unwrap();
         queue1.delete(job2).unwrap().unwrap();
 
-        let mut chans = queue1.list_tubes().unwrap();
+        let mut chans = queue1.list_channels().unwrap();
         chans.sort();
         assert_eq!(chans, vec![
             "prank-calls1".to_string(),
@@ -1148,12 +1158,12 @@ mod tests {
     fn clean_channels() {
         // channels should clean if they are empty AND have no subscribers
         let queue1 = make_queue(16);
-        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job2 = queue1.enqueue("prank-calls2", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let _job3 = queue1.enqueue("prank-calls3", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Delay>).unwrap();
-        let job4 = queue1.enqueue("prank-calls4", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Delay>).unwrap();
+        let _job1 = queue1.enqueue("prank-calls1", Vec::from("i'm detective john kimble".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job2 = queue1.enqueue("prank-calls2", Vec::from("yeah sure you are".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let _job3 = queue1.enqueue("prank-calls3", Vec::from("i'm a cop you idiot".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
+        let job4 = queue1.enqueue("prank-calls4", Vec::from("well how 'bout i come over there and i whoop your god damn ass??".as_bytes()), 1024, 300, None::<Timestamp>).unwrap();
 
-        let mut chans = queue1.list_tubes().unwrap();
+        let mut chans = queue1.list_channels().unwrap();
         chans.sort();
         assert_eq!(chans, vec![
             "prank-calls1".to_string(),
@@ -1167,7 +1177,7 @@ mod tests {
         queue1.delete(job4).unwrap().unwrap();
         queue1.delete(job2).unwrap().unwrap();
 
-        let mut chans = queue1.list_tubes().unwrap();
+        let mut chans = queue1.list_channels().unwrap();
         chans.sort();
         assert_eq!(chans, vec![
             "prank-calls1".to_string(),
@@ -1177,7 +1187,7 @@ mod tests {
         ]);
 
         queue1.unsubscribe("prank-calls2", sub2).unwrap();
-        let mut chans = queue1.list_tubes().unwrap();
+        let mut chans = queue1.list_channels().unwrap();
         chans.sort();
         assert_eq!(chans, vec![
             "prank-calls1".to_string(),
@@ -1186,7 +1196,7 @@ mod tests {
         ]);
 
         queue1.unsubscribe("prank-calls4", sub4).unwrap();
-        let mut chans = queue1.list_tubes().unwrap();
+        let mut chans = queue1.list_channels().unwrap();
         chans.sort();
         assert_eq!(chans, vec![
             "prank-calls1".to_string(),

@@ -58,7 +58,7 @@ wrapper_primitive! {
 
 wrapper_primitive! {
     /// Holds a unix timestamp in ms, used for delaying jobs.
-    Delay, i64
+    Timestamp, i64
 }
 
 wrapper_primitive! {
@@ -92,19 +92,19 @@ pub struct JobState {
     priority: Priority,
     /// The job's current status
     status: JobStatus,
-    /// How many ms this job can be reserved before it is released
+    /// How many seconds this job can be reserved before it is released
     /// automatically
-    ttr: u64,
+    ttr: u32,
     /// An optional delay. This is stored as a timestamp (ms) after which the job will be
     /// ready for processing again.
-    delay: Option<Delay>,
+    delay: Option<Timestamp>,
 }
 
 impl JobState {
     /// Create a new `JobState`
-    pub fn new<P, D>(channel: String, priority: P, status: JobStatus, ttr: u64, delay: Option<D>) -> Self
+    pub fn new<P, D>(channel: String, priority: P, status: JobStatus, ttr: u32, delay: Option<D>) -> Self
         where P: Into<Priority>,
-              D: Into<Delay>,
+              D: Into<Timestamp>,
     {
         Self {
             channel,
@@ -211,12 +211,12 @@ pub struct JobMeta {
     /// A job's delay can be thought of as either primary or secondary data, so instead of forcing
     /// one or the other we allow the delay to be stored in either [`JobState`] as primary data or
     /// here in `JobMeta` as secondary data depending on what the user wants.
-    delay: Option<Delay>,
+    delay: Option<Timestamp>,
 }
 
 impl JobMeta {
     /// Consumes this `JobMeta` and returns job metrics and the delay value
-    pub fn take(self) -> (JobMetrics, Option<Delay>) {
+    pub fn take(self) -> (JobMetrics, Option<Timestamp>) {
         let Self { metrics, delay } = self;
         (metrics, delay)
     }

@@ -8,7 +8,7 @@
 
 use ahash::AHashMap;
 use crate::{
-    job::{Delay, FailID, JobID, Priority},
+    job::{FailID, JobID, Priority, Timestamp},
 };
 use crossbeam_channel::{self, Sender, Receiver};
 use getset::{CopyGetters, Getters, MutGetters};
@@ -68,14 +68,14 @@ pub struct Channel {
     /// We'll still have to iterate over the Vec to *find* the job, but that's not a huge deal,
     /// unless we have millions of jobs expiring at the exact same timestamp-ms (possible, but
     /// not super likely), and also only matters when kicking jobs. Also who kicks delayed jobs?
-    delayed: BTreeMap<Delay, Vec<Option<(JobID, Priority)>>>,
+    delayed: BTreeMap<Timestamp, Vec<Option<(JobID, Priority)>>>,
     /// Failed jobs, stored FIFO
     failed: BTreeMap<FailID, (JobID, Priority)>,
     /// Is our heroic channel paused? This means all reserves should return `None` until the
     /// stored delay value lapses. Keep in mind, the channel itself doesn't track time, so it's
     /// up to the implementor to call [`Channel::update_paused`] periodically with the current
     /// time.
-    paused: Option<(Delay, Delay)>,
+    paused: Option<(Timestamp, Timestamp)>,
     /// Our heroic channel metrics
     metrics: ChannelMetrics,
 }
@@ -83,7 +83,7 @@ pub struct Channel {
 impl Channel {
     /// Create a new empty `Channel`.
     pub fn new() -> Self {
-        let (sender, signal) = crossbeam_channel::bounded(24);
+        let (sender, signal) = crossbeam_channel::bounded(16);
         Self {
             signal,
             sender,
@@ -100,7 +100,8 @@ impl Channel {
     #[tracing::instrument(skip(self))]
     fn event(&self, ev: ChannelMod) {
         match self.sender().try_send(ev) {
-            Err(e) => info!("Channel::event() -- problem sending event, channel possibly full {:?}", e),
+            Err(crossbeam_channel::TrySendError::Full(_)) => {}
+            Err(e) => info!("Channel::event() -- problem sending event {:?}", e),
             _ => {}
         }
     }
@@ -113,7 +114,7 @@ impl Channel {
         }
     }
 
-    fn push_delayed_impl(&mut self, job_id: JobID, priority: Priority, delay: Delay) {
+    fn push_delayed_impl(&mut self, job_id: JobID, priority: Priority, delay: Timestamp) {
         let entry = self.delayed.entry(delay).or_insert_with(|| Vec::with_capacity(1));
         (*entry).push(Some((job_id, priority)));
         *self.metrics_mut().delayed_mut() += 1;
@@ -137,7 +138,7 @@ impl Channel {
     /// Takes a few arguments about a job and puts it into the correct location (ready,
     /// failed, delayed) based on its state. This is mainly useful for restoring from the
     /// storage system.
-    pub(crate) fn restore(&mut self, job_id: JobID, priority: Priority, delay: Option<Delay>, fail_id: Option<FailID>) {
+    pub(crate) fn restore(&mut self, job_id: JobID, priority: Priority, delay: Option<Timestamp>, fail_id: Option<FailID>) {
         match (fail_id, delay) {
             (Some(fail_id), _) => {
                 self.push_failed_impl(job_id, fail_id, priority);
@@ -154,9 +155,9 @@ impl Channel {
     /// Push a job into this channel's queue. It can be given an optional delay value (a ms
     /// timestamp) that will delay processing of that job until the delay passes.
     #[tracing::instrument(skip(self))]
-    pub fn push<P, D>(&mut self, id: JobID, priority: P, delay: Option<D>)
+    pub fn push<P, T>(&mut self, id: JobID, priority: P, delay: Option<T>)
         where P: Into<Priority> + std::fmt::Debug,
-              D: Into<Delay> + std::fmt::Debug,
+              T: Into<Timestamp> + std::fmt::Debug,
     {
         let priority = priority.into();
         let delay = delay.map(|x| x.into());
@@ -202,9 +203,9 @@ impl Channel {
 
     /// Release a reserved job.
     #[tracing::instrument(skip(self))]
-    pub fn release<P, D>(&mut self, id: JobID, priority: Option<P>, delay: Option<D>) -> Option<JobID>
+    pub fn release<P, T>(&mut self, id: JobID, priority: Option<P>, delay: Option<T>) -> Option<JobID>
         where P: Into<Priority> + std::fmt::Debug,
-              D: Into<Delay> + std::fmt::Debug,
+              T: Into<Timestamp> + std::fmt::Debug,
     {
         let existing = self.reserved_mut().remove(&id)?;
         let priority = priority
@@ -253,8 +254,8 @@ impl Channel {
 
     /// Delete a ready job.
     #[tracing::instrument(skip(self))]
-    pub fn delete_delayed<D>(&mut self, delay: D, job_id: JobID) -> Option<JobID>
-        where D: Into<Delay> + std::fmt::Debug,
+    pub fn delete_delayed<T>(&mut self, delay: T, job_id: JobID) -> Option<JobID>
+        where T: Into<Timestamp> + std::fmt::Debug,
     {
         let delay = delay.into();
         let delqueue = self.delayed_mut().get_mut(&delay)?;
@@ -396,9 +397,9 @@ impl Channel {
     /// Find all delayed jobs that are ready to move to the ready queue and move them. Returns the
     /// number of jobs we moved from delayed into ready.
     #[tracing::instrument(skip(self))]
-    pub fn expire_delayed(&mut self, now: &Delay) -> Vec<JobID> {
+    pub fn expire_delayed(&mut self, now: &Timestamp) -> Vec<JobID> {
         let mut expired = Vec::new();
-        let buckets: Vec<Delay> = self.delayed().keys()
+        let buckets: Vec<Timestamp> = self.delayed().keys()
             .filter(|x| x <= &now)
             .map(|x| x.clone())
             .collect::<Vec<_>>();
@@ -449,7 +450,7 @@ impl Channel {
     /// which is used to determine how long the channel has been paused, if you're into that
     /// kind of thing.
     #[tracing::instrument(skip(self))]
-    pub fn pause(&mut self, now: Delay, unpause_at: Delay) {
+    pub fn pause(&mut self, now: Timestamp, unpause_at: Timestamp) {
         *self.paused_mut() = Some((unpause_at, now));
         *self.metrics_mut().cmd_pause_mut() += 1;
     }
@@ -465,7 +466,7 @@ impl Channel {
     /// We return `true` if the channel was unpaused as a result of this call,
     /// otherwise false.
     #[tracing::instrument(skip(self))]
-    pub fn update_paused(&mut self, now: &Delay) -> bool {
+    pub fn update_paused(&mut self, now: &Timestamp) -> bool {
         if let Some((then, _)) = self.paused().as_ref() {
             if now >= then {
                 *self.paused_mut() = None;
@@ -599,9 +600,9 @@ mod tests {
         let mut channel = Channel::new();
         assert_counts!(&channel, 0, 0, 0, 0, 0, 0, 0);
 
-        channel.push(JobID::from(45), 1024, None::<Delay>);
-        channel.push(JobID::from(32), 1024, None::<Delay>);
-        channel.push(JobID::from(69), 1000, None::<Delay>);
+        channel.push(JobID::from(45), 1024, None::<Timestamp>);
+        channel.push(JobID::from(32), 1024, None::<Timestamp>);
+        channel.push(JobID::from(69), 1000, None::<Timestamp>);
         assert_counts!(&channel, 1, 3, 0, 0, 0, 0, 3);
 
         let job1 = channel.reserve_next();
@@ -622,12 +623,12 @@ mod tests {
     #[test]
     fn job_ordering() {
         let mut channel = Channel::new();
-        channel.push(JobID::from(1102), 1024, None::<Delay>);
-        channel.push(JobID::from(1100), 1024, None::<Delay>);
-        channel.push(JobID::from(1101), 1024, None::<Delay>);
-        channel.push(JobID::from(2001), 999, None::<Delay>);
-        channel.push(JobID::from(2000), 1000, None::<Delay>);
-        channel.push(JobID::from(2002), 500, None::<Delay>);
+        channel.push(JobID::from(1102), 1024, None::<Timestamp>);
+        channel.push(JobID::from(1100), 1024, None::<Timestamp>);
+        channel.push(JobID::from(1101), 1024, None::<Timestamp>);
+        channel.push(JobID::from(2001), 999, None::<Timestamp>);
+        channel.push(JobID::from(2000), 1000, None::<Timestamp>);
+        channel.push(JobID::from(2002), 500, None::<Timestamp>);
 
         let job1 = channel.reserve_next().unwrap();
         let job2 = channel.reserve_next().unwrap();
@@ -647,8 +648,8 @@ mod tests {
     #[test]
     fn push_reserve_release() {
         let mut channel = Channel::new();
-        channel.push(JobID::from(1111), 1024, None::<Delay>);
-        channel.push(JobID::from(1112), 1024, None::<Delay>);
+        channel.push(JobID::from(1111), 1024, None::<Timestamp>);
+        channel.push(JobID::from(1112), 1024, None::<Timestamp>);
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
 
         let job1 = channel.reserve_next().unwrap();
@@ -656,7 +657,7 @@ mod tests {
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
         assert_eq!(channel.peek_ready(), Some((1024.into(), JobID::from(1112))));
 
-        channel.release(job1, None::<Priority>, None::<Delay>).unwrap();
+        channel.release(job1, None::<Priority>, None::<Timestamp>).unwrap();
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
 
         // job2 should be the same job as before because of ordering
@@ -668,19 +669,19 @@ mod tests {
         assert_eq!(job3, JobID::from(1112));
         assert_counts!(&channel, 0, 0, 2, 0, 0, 0, 2);
 
-        channel.release(JobID::from(1112), None::<Priority>, None::<Delay>).unwrap();
+        channel.release(JobID::from(1112), None::<Priority>, None::<Timestamp>).unwrap();
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
-        channel.release(JobID::from(1111), None::<Priority>, None::<Delay>).unwrap();
+        channel.release(JobID::from(1111), None::<Priority>, None::<Timestamp>).unwrap();
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
         assert_eq!(channel.peek_ready(), Some((1024.into(), JobID::from(1111))));
 
         let job4 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
-        channel.release(job4, Some(1000), None::<Delay>).unwrap();
+        channel.release(job4, Some(1000), None::<Timestamp>).unwrap();
         assert_counts!(&channel, 1, 2, 0, 0, 0, 0, 2);
         let job5 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 1, 1, 0, 0, 0, 2);
-        channel.release(job5, Some(2000), None::<Delay>).unwrap();
+        channel.release(job5, Some(2000), None::<Timestamp>).unwrap();
         assert_counts!(&channel, 0, 2, 0, 0, 0, 0, 2);
 
         let job6 = channel.reserve_next().unwrap();
@@ -693,7 +694,7 @@ mod tests {
         assert_counts!(&channel, 0, 0, 0, 2, 0, 0, 2);
 
         // won't "release" non-reserved jobs
-        let job8 = channel.release(JobID::from(69696969), Some(1024), None::<Delay>);
+        let job8 = channel.release(JobID::from(69696969), Some(1024), None::<Timestamp>);
         assert_eq!(job8, None);
         assert_counts!(&channel, 0, 0, 0, 2, 0, 0, 2);
     }
@@ -702,7 +703,7 @@ mod tests {
     fn reserve_job() {
         let mut channel = Channel::new();
         for i in 0..10 {
-            channel.push(JobID::from(i), 1024, None::<Delay>);
+            channel.push(JobID::from(i), 1024, None::<Timestamp>);
         }
         assert_counts!(&channel, 0, 10, 0, 0, 0, 0, 10);
         assert_eq!(channel.reserve_job(1024, JobID::from(999)), None);
@@ -740,12 +741,12 @@ mod tests {
         assert_eq!(channel.reserve_next(), None);
         assert_eq!(channel.reserve_next(), None);
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1678169565577)), vec![]);
+        assert_eq!(channel.expire_delayed(&Timestamp::from(1678169565577)), vec![]);
         assert_counts!(&channel, 0, 0, 0, 4, 0, 0, 4);
         assert_eq!(channel.reserve_next(), None);
         assert_eq!(channel.delayed().len(), 3); // cheating, but oh well.
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1678169565578)), vec![JobID::from(3), JobID::from(1)]);
+        assert_eq!(channel.expire_delayed(&Timestamp::from(1678169565578)), vec![JobID::from(3), JobID::from(1)]);
         assert_counts!(&channel, 0, 2, 0, 2, 0, 0, 4);
         assert_eq!(channel.peek_delayed(), Some(JobID::from(2)));
         assert_eq!(channel.reserve_next(), Some(JobID::from(1)));
@@ -753,14 +754,14 @@ mod tests {
         assert_counts!(&channel, 0, 0, 2, 2, 0, 0, 4);
         assert_eq!(channel.delayed().len(), 2); // cheating, but oh well.
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1678169565578)), vec![]);
+        assert_eq!(channel.expire_delayed(&Timestamp::from(1678169565578)), vec![]);
         assert_counts!(&channel, 0, 0, 2, 2, 0, 0, 4);
         assert_eq!(channel.peek_delayed(), Some(JobID::from(2)));
         assert_eq!(channel.reserve_next(), None);
         assert_counts!(&channel, 0, 0, 2, 2, 0, 0, 4);
         assert_eq!(channel.delayed().len(), 2); // cheating, but oh well.
 
-        assert_eq!(channel.expire_delayed(&Delay::from(1778169565578)), vec![JobID::from(2), JobID::from(4)]);
+        assert_eq!(channel.expire_delayed(&Timestamp::from(1778169565578)), vec![JobID::from(2), JobID::from(4)]);
         assert_eq!(channel.peek_delayed(), None);
         assert_counts!(&channel, 1, 2, 2, 0, 0, 0, 4);
         assert_eq!(channel.delayed().len(), 0); // cheating, but oh well.
@@ -769,9 +770,9 @@ mod tests {
     #[test]
     fn push_reserve_delete_reserved() {
         let mut channel = Channel::new();
-        channel.push(JobID::from(123), 1024, None::<Delay>);
-        channel.push(JobID::from(345), 1024, None::<Delay>);
-        channel.push(JobID::from(456), 1024, None::<Delay>);
+        channel.push(JobID::from(123), 1024, None::<Timestamp>);
+        channel.push(JobID::from(345), 1024, None::<Timestamp>);
+        channel.push(JobID::from(456), 1024, None::<Timestamp>);
         assert_counts!(&channel, 0, 3, 0, 0, 0, 0, 3);
 
         // can't delete a non-reserved job
@@ -798,9 +799,9 @@ mod tests {
     #[test]
     fn delete_ready() {
         let mut channel = Channel::new();
-        channel.push(JobID::from(123), 1024, None::<Delay>);
-        channel.push(JobID::from(345), 1000, None::<Delay>);
-        channel.push(JobID::from(456), 1024, None::<Delay>);
+        channel.push(JobID::from(123), 1024, None::<Timestamp>);
+        channel.push(JobID::from(345), 1000, None::<Timestamp>);
+        channel.push(JobID::from(456), 1024, None::<Timestamp>);
         channel.push(JobID::from(789), 1024, Some(1111));
         assert_counts!(&channel, 1, 3, 0, 1, 0, 0, 4);
         channel.delete_ready(1024, JobID::from(123)).unwrap();
@@ -824,7 +825,7 @@ mod tests {
         channel.push(JobID::from(123), 1024, Some(5000));
         channel.push(JobID::from(345), 1000, Some(4000));
         channel.push(JobID::from(456), 1024, Some(3000));
-        channel.push(JobID::from(789), 1024, None::<Delay>);
+        channel.push(JobID::from(789), 1024, None::<Timestamp>);
         assert_counts!(&channel, 0, 1, 0, 3, 0, 0, 4);
         assert_eq!(channel.delete_delayed(5000, JobID::from(123)).unwrap(), JobID::from(123));
         assert_counts!(&channel, 0, 1, 0, 2, 1, 0, 4);
@@ -842,10 +843,10 @@ mod tests {
     #[test]
     fn delete_failed() {
         let mut channel = Channel::new();
-        channel.push(JobID::from(123), 1024, None::<Delay>);
-        channel.push(JobID::from(345), 1000, None::<Delay>);
-        channel.push(JobID::from(456), 1024, None::<Delay>);
-        channel.push(JobID::from(789), 1024, None::<Delay>);
+        channel.push(JobID::from(123), 1024, None::<Timestamp>);
+        channel.push(JobID::from(345), 1000, None::<Timestamp>);
+        channel.push(JobID::from(456), 1024, None::<Timestamp>);
+        channel.push(JobID::from(789), 1024, None::<Timestamp>);
         assert_counts!(&channel, 1, 4, 0, 0, 0, 0, 4);
 
         let job1 = channel.reserve_next().unwrap();
@@ -856,7 +857,7 @@ mod tests {
         assert_counts!(&channel, 0, 1, 3, 0, 0, 0, 4);
         let job4 = channel.reserve_next().unwrap();
         assert_counts!(&channel, 0, 0, 4, 0, 0, 0, 4);
-        channel.release(job3, None::<Priority>, None::<Delay>).unwrap();
+        channel.release(job3, None::<Priority>, None::<Timestamp>).unwrap();
         channel.release(job4, None::<Priority>, Some(5000)).unwrap();
         assert_counts!(&channel, 0, 1, 2, 1, 0, 0, 4);
 
@@ -879,7 +880,7 @@ mod tests {
     fn push_reserve_failed_kick_peek_failed() {
         let mut channel = Channel::new();
         for i in 0..100 {
-            channel.push(JobID::from(i), 1024, None::<Delay>);
+            channel.push(JobID::from(i), 1024, None::<Timestamp>);
         }
         assert_counts!(&channel, 0, 100, 0, 0, 0, 0, 100);
 
@@ -984,11 +985,11 @@ mod tests {
     #[test]
     fn pause() {
         let mut channel = Channel::new();
-        channel.push(JobID::from(42), 1024, None::<Delay>);
+        channel.push(JobID::from(42), 1024, None::<Timestamp>);
         assert_eq!(channel.reserve_next(), Some(JobID::from(42)));
         assert_counts!(&channel, 0, 0, 1, 0, 0, 0, 1);
         assert_eq!(channel.metrics().cmd_pause(), 0);
-        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Timestamp>), Some(JobID::from(42)));
         channel.pause(10.into(), 20.into());
         assert_eq!(channel.metrics().cmd_pause(), 1);
         assert_counts!(&channel, 0, 1, 0, 0, 0, 0, 1);
@@ -997,9 +998,9 @@ mod tests {
         channel.unpause();
         assert_eq!(channel.metrics().cmd_pause(), 1);
         assert_eq!(channel.reserve_next(), Some(JobID::from(42)));
-        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Timestamp>), Some(JobID::from(42)));
         assert_eq!(channel.reserve_job(1024, JobID::from(42)), Some(JobID::from(42)));
-        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Timestamp>), Some(JobID::from(42)));
         channel.pause(20.into(), 30.into());
         assert_eq!(channel.metrics().cmd_pause(), 2);
         assert_eq!(channel.reserve_next(), None);
@@ -1011,9 +1012,9 @@ mod tests {
         assert_eq!(channel.update_paused(&30.into()), true);
         assert_eq!(channel.metrics().cmd_pause(), 2);
         assert_eq!(channel.reserve_next(), Some(JobID::from(42)));
-        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Timestamp>), Some(JobID::from(42)));
         assert_eq!(channel.reserve_job(1024, JobID::from(42)), Some(JobID::from(42)));
-        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Delay>), Some(JobID::from(42)));
+        assert_eq!(channel.release(JobID::from(42), None::<Priority>, None::<Timestamp>), Some(JobID::from(42)));
     }
 
     #[test]
@@ -1025,17 +1026,17 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             assert_eq!(channel.metrics.subscribers, 1);
-            channel.push(JobID::from(1), 1024, None::<Delay>);
-            channel.push(JobID::from(2), 1024, None::<Delay>);
+            channel.push(JobID::from(1), 1024, None::<Timestamp>);
+            channel.push(JobID::from(2), 1024, None::<Timestamp>);
             channel.push(JobID::from(3), 1024, Some(167000000));
             channel.push(JobID::from(4), 1024, Some(167000000));
             let res1 = channel.reserve_next().unwrap();
             let res2 = channel.reserve_next().unwrap();
             channel.delete_reserved(res1);
             channel.fail_reserved(FailID::from(1), res2);
-            channel.expire_delayed(&Delay::from(167000001));
+            channel.expire_delayed(&Timestamp::from(167000001));
             let res3 = channel.reserve_next().unwrap();
-            channel.release(res3, None::<Priority>, None::<Delay>);
+            channel.release(res3, None::<Priority>, None::<Timestamp>);
             channel.unsubscribe(sig2);
             assert_eq!(channel.metrics.subscribers, 0);
         });
