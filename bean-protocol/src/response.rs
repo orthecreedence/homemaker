@@ -1,9 +1,6 @@
 //! Handles creating responses to clients.
 
-use crate::{
-    error::{Result},
-};
-use std::io::Write;
+use tokio::io::{self, AsyncWriteExt};
 
 /// Represents a response to a client.
 pub enum Response<'a> {
@@ -60,83 +57,83 @@ pub enum Response<'a> {
 }
 
 impl<'a> Response<'a> {
-    pub fn serialize_into<W>(&'a self, mut writer: W) -> Result<usize>
-        where W: Write,
+    pub async fn serialize_into<W>(&'a self, writer: &mut W) -> io::Result<usize>
+        where W: AsyncWriteExt + std::marker::Unpin,
     {
         let res = match self {
-            Self::BadFormat => writer.write(b"BAD_FORMAT\r\n")?,
-            Self::Buried => writer.write(b"BURIED\r\n")?,
+            Self::BadFormat => writer.write(b"BAD_FORMAT\r\n").await?,
+            Self::Buried => writer.write(b"BURIED\r\n").await?,
             Self::BuriedJobID(job_id) => {
-                let n1 = writer.write(b"BURIED ")?;
-                let n2 = writer.write(job_id.to_string().as_bytes())?;
-                let n3 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"BURIED ").await?;
+                let n2 = writer.write(job_id.to_string().as_bytes()).await?;
+                let n3 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3
             }
-            Self::DeadlineSoon => writer.write(b"DEADLINE_SOON\r\n")?,
-            Self::Deleted => writer.write(b"DELETED\r\n")?,
-            Self::Draining => writer.write(b"DRAINING\r\n")?,
-            Self::ExpectedCRLF => writer.write(b"EXPECTED_CRLF\r\n")?,
+            Self::DeadlineSoon => writer.write(b"DEADLINE_SOON\r\n").await?,
+            Self::Deleted => writer.write(b"DELETED\r\n").await?,
+            Self::Draining => writer.write(b"DRAINING\r\n").await?,
+            Self::ExpectedCRLF => writer.write(b"EXPECTED_CRLF\r\n").await?,
             Self::Found(job_id, job_data) => {
-                let n1 = writer.write(b"FOUND ")?;
-                let n2 = writer.write(job_id.to_string().as_bytes())?;
-                let n3 = writer.write(b" ")?;
-                let n4 = writer.write(job_data.len().to_string().as_bytes())?;
-                let n5 = writer.write(b"\r\n")?;
-                let n6 = writer.write(job_data)?;
-                let n7 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"FOUND ").await?;
+                let n2 = writer.write(job_id.to_string().as_bytes()).await?;
+                let n3 = writer.write(b" ").await?;
+                let n4 = writer.write(job_data.len().to_string().as_bytes()).await?;
+                let n5 = writer.write(b"\r\n").await?;
+                let n6 = writer.write(job_data).await?;
+                let n7 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3 + n4 + n5 + n6 + n7
             }
             Self::Inserted(job_id) => {
-                let n1 = writer.write(b"INSERTED ")?;
-                let n2 = writer.write(job_id.to_string().as_bytes())?;
-                let n3 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"INSERTED ").await?;
+                let n2 = writer.write(job_id.to_string().as_bytes()).await?;
+                let n3 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3
             }
-            Self::InternalError => writer.write(b"INTERNAL_ERROR\r\n")?,
-            Self::JobTooBig => writer.write(b"JOB_TOO_BIG\r\n")?,
-            Self::Kicked => writer.write(b"KICKED\r\n")?,
+            Self::InternalError => writer.write(b"INTERNAL_ERROR\r\n").await?,
+            Self::JobTooBig => writer.write(b"JOB_TOO_BIG\r\n").await?,
+            Self::Kicked => writer.write(b"KICKED\r\n").await?,
             Self::KickedJobs(num) => {
-                let n1 = writer.write(b"KICKED ")?;
-                let n2 = writer.write(num.to_string().as_bytes())?;
-                let n3 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"KICKED ").await?;
+                let n2 = writer.write(num.to_string().as_bytes()).await?;
+                let n3 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3
             }
-            Self::NotFound => writer.write(b"NOT_FOUND\r\n")?,
-            Self::NotIgnored => writer.write(b"NOT_IGNORED\r\n")?,
+            Self::NotFound => writer.write(b"NOT_FOUND\r\n").await?,
+            Self::NotIgnored => writer.write(b"NOT_IGNORED\r\n").await?,
             Self::Ok(yaml) => {
-                let n1 = writer.write(b"OK ")?;
-                let n2 = writer.write(yaml.as_bytes().len().to_string().as_bytes())?;
-                let n3 = writer.write(b"\r\n")?;
-                let n4 = writer.write(yaml.as_bytes())?;
-                let n5 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"OK ").await?;
+                let n2 = writer.write(yaml.as_bytes().len().to_string().as_bytes()).await?;
+                let n3 = writer.write(b"\r\n---\r\n").await?;
+                let n4 = writer.write(yaml.as_bytes()).await?;
+                let n5 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3 + n4 + n5
             }
-            Self::OutOfMemory => writer.write(b"OUT_OF_MEMORY\r\n")?,
-            Self::Paused => writer.write(b"PAUSED\r\n")?,
-            Self::Released => writer.write(b"RELEASED\r\n")?,
+            Self::OutOfMemory => writer.write(b"OUT_OF_MEMORY\r\n").await?,
+            Self::Paused => writer.write(b"PAUSED\r\n").await?,
+            Self::Released => writer.write(b"RELEASED\r\n").await?,
             Self::Reserved(job_id, job_data) => {
-                let n1 = writer.write(b"RESERVED ")?;
-                let n2 = writer.write(job_id.to_string().as_bytes())?;
-                let n3 = writer.write(b" ")?;
-                let n4 = writer.write(job_data.len().to_string().as_bytes())?;
-                let n5 = writer.write(b"\r\n")?;
-                let n6 = writer.write(job_data)?;
-                let n7 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"RESERVED ").await?;
+                let n2 = writer.write(job_id.to_string().as_bytes()).await?;
+                let n3 = writer.write(b" ").await?;
+                let n4 = writer.write(job_data.len().to_string().as_bytes()).await?;
+                let n5 = writer.write(b"\r\n").await?;
+                let n6 = writer.write(job_data).await?;
+                let n7 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3 + n4 + n5 + n6 + n7
             }
-            Self::TimedOut => writer.write(b"TIMED_OUT\r\n")?,
-            Self::Touched => writer.write(b"TOUCHED\r\n")?,
-            Self::UnknownCommand => writer.write(b"UNKNOWN_COMMAND\r\n")?,
+            Self::TimedOut => writer.write(b"TIMED_OUT\r\n").await?,
+            Self::Touched => writer.write(b"TOUCHED\r\n").await?,
+            Self::UnknownCommand => writer.write(b"UNKNOWN_COMMAND\r\n").await?,
             Self::Using(chan) => {
-                let n1 = writer.write(b"USING ")?;
-                let n2 = writer.write(chan.as_bytes())?;
-                let n3 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"USING ").await?;
+                let n2 = writer.write(chan.as_bytes()).await?;
+                let n3 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3
             }
             Self::Watching(num) => {
-                let n1 = writer.write(b"WATCHING ")?;
-                let n2 = writer.write(num.to_string().as_bytes())?;
-                let n3 = writer.write(b"\r\n")?;
+                let n1 = writer.write(b"WATCHING ").await?;
+                let n2 = writer.write(num.to_string().as_bytes()).await?;
+                let n3 = writer.write(b"\r\n").await?;
                 n1 + n2 + n3
             }
         };
@@ -147,15 +144,22 @@ impl<'a> Response<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::BufWriter;
 
     macro_rules! test_bare {
         ($variant:expr, $expect:expr) => {{
-            let mut buf = [0u8; 1024];
+            let buf = Vec::with_capacity(4096);
             let expect: &[u8] = $expect;
             let res = $variant;
-            let n = res.serialize_into(buf.as_mut_slice()).unwrap();
+            let mut writer = BufWriter::new(buf);
+            let n = tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let res = res.serialize_into(&mut writer).await;
+                writer.flush().await.unwrap();
+                res
+            }).unwrap();
+            let buf = writer.into_inner();
             assert_eq!(n, expect.len());
-            assert_eq!(&buf[0..n], expect);
+            assert_eq!(&buf[..], expect);
         }}
     }
 

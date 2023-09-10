@@ -10,6 +10,7 @@ pub enum Error<'a> {
     /// A bad channel name was given.
     #[error("Bad channel name")]
     BadChannel,
+
     /// There was a problem converting bytes, which are expected to be utf8-encoded,
     /// into a string.
     #[error("Error converting bytes to utf8 string")]
