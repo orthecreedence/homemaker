@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1.0.70"
-queue = { path = "queue" }
+bean-protocol = { path = "bean-protocol" }
+bytes = "1.4.0"
+chrono = "0.4.26"
+clap = { version = "4.3.0", features = ["derive", "wrap_help"] }
+homemaker-queue = { path = "queue" }
+serde = { version = "1.0.188", features = ["serde_derive"] }
+serde_yaml = "0.9.25"
+tokio = { version = "1.28.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
