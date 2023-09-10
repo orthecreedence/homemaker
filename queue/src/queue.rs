@@ -164,8 +164,8 @@ impl Queue {
         let state = JobState::new(channel_name.into(), priority, JobStatus::Ready, ttr, now, delay);
         let job = Job::new(job_id.clone(), job_data, state);
 
-        self.store().primary().insert(ser::serialize(&job_id)?, ser::serialize(&JobStore::from(&job))?)?;
-        self.store().meta().insert(ser::serialize(&job_id)?, ser::serialize(&JobMeta::from(&job))?)?;
+        self.store().push_mod(Mod::CreateJobPrimary(job_id.clone(), JobStore::from(&job)))?;
+        self.store().push_mod(Mod::CreateJobMeta(job_id.clone(), JobMeta::from(&job)))?;
         let mut channel = self.channels().entry(job.state().channel().clone()).or_insert_with(|| Channel::new());
         channel.push(job_id.clone(), priority, delay);
 
@@ -445,6 +445,14 @@ impl Queue {
             .map(|x| Some(x))
     }
 
+    /// Returns if a job is reserved or not.
+    #[tracing::instrument(skip(self))]
+    pub fn job_is_reserved(&self, job_id: &JobID, channel: &str) -> Result<bool> {
+        let channel = self.channels().get(channel)
+            .ok_or_else(|| Error::ChannelNotFound(channel.to_string()))?;
+        Ok(channel.job_is_reserved(job_id))
+    }
+
     /// list channels
     #[tracing::instrument(skip(self))]
     pub fn list_channels(&self) -> Result<Vec<String>> {
@@ -479,7 +487,17 @@ impl Queue {
         Ok(())
     }
 
-    /// Load a job.
+    /// Load a job by grabbing its primary data and ignoring meta.
+    fn load_job_primary(&self, job_id: &JobID) -> Result<Job> {
+        let job_id_ser = to_key(job_id)?;
+        let job_ser = self.store().primary().get(&job_id_ser)?
+            .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
+        let store: JobStore = ser::deserialize(job_ser.as_ref())?;
+        let job = Job::create_from_parts(job_id.clone(), store, None, *self.config().delay_in_meta());
+        Ok(job)
+    }
+
+    /// Load a job by grabbing its primary and meta data and merging them.
     fn load_full_job(&self, job_id: &JobID) -> Result<Job> {
         let job_id_ser = to_key(job_id)?;
         let job_ser = self.store().primary().get(&job_id_ser)?

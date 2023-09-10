@@ -17,6 +17,10 @@ pub(crate) fn to_key<T: Serialize>(item: &T) -> Result<Vec<u8>> {
 /// Defines all the operations that can modify our storage system (writes).
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Mod {
+    /// Create a job's meta record
+    CreateJobMeta(JobID, JobMeta),
+    /// Create a job's primary store record
+    CreateJobPrimary(JobID, JobStore),
     /// Clear a job's delay value from the meta store
     ClearDelayMeta(JobID),
     /// Clear a job's delay value from the primary store
@@ -29,7 +33,7 @@ pub(crate) enum Mod {
     SetStatus(JobID, JobStatus),
 }
 
-/// Defines all the operations that can modify our storage system (writes).
+/// The result of a modification.
 #[derive(Debug)]
 pub enum ModResult {
     Meta(Option<JobMeta>),
@@ -65,6 +69,14 @@ impl Store {
     /// things like replication across instances for HA.
     pub(crate) fn push_mod(&self, mod_op: Mod) -> Result<ModResult> {
         let res = match mod_op {
+            Mod::CreateJobMeta(job_id, meta) => {
+                self.meta().insert(ser::serialize(&job_id)?, ser::serialize(&meta)?)?;
+                ModResult::Meta(Some(meta))
+            }
+            Mod::CreateJobPrimary(job_id, store) => {
+                self.primary().insert(ser::serialize(&job_id)?, ser::serialize(&store)?)?;
+                ModResult::Store(Some(store))
+            }
             Mod::ClearDelayMeta(job_id) => {
                 self.update_and_save_meta(to_key(&job_id)?, |meta| {
                     *meta.delay_mut() = None;

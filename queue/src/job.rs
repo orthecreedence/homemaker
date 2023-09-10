@@ -95,7 +95,7 @@ pub struct JobState {
     /// How many seconds this job can be reserved before it is released
     /// automatically
     ttr: u32,
-    /// When the job was created.
+    /// When the job was created (in ms)
     created: Timestamp,
     /// An optional delay. This is stored as a timestamp (ms) after which the job will be
     /// ready for processing again.

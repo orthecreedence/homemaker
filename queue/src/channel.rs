@@ -503,6 +503,12 @@ impl Channel {
             self.failed().len() == 0 &&
             self.metrics().subscribers() == 0
     }
+
+    /// Returns if a job is reserved.
+    #[tracing::instrument(skip(self))]
+    pub fn job_is_reserved(&self, job_id: &JobID) -> bool {
+        self.reserved().get(job_id).is_some()
+    }
 }
 
 #[cfg(test)]
